@@ -4,15 +4,15 @@ import os
 import json
 import asyncio
 import httpx
+import logging
+import time
+import re
 from web3 import Web3
 from web3.exceptions import ContractLogicError, BadFunctionCallOutput, InvalidAddress
 from typing import Tuple, Any, Dict, Optional, List
 from dotenv import load_dotenv
 from telegram.ext import ContextTypes 
 from telegram import Update
-import logging
-import time
-import re
 from typing import List, Dict, Any
 
 # --- 1. Konfigurasi Global & Konstanta ---
@@ -40,6 +40,7 @@ SOURCIFY_REPO = "https://repo.sourcify.dev/contracts"
 # --- ALAMAT KRITIS ---
 PULSEX_V2_ROUTER_ADDR = "0x165C3410fC91EF562C50559f7d2289fEbed552d9"
 WPLS_ADDRESS = "0xA1077a294dDE1B09bB078844df40758a5D0f9a27"
+WPLS_CHECKSUM_LOWER = WPLS_ADDRESS.lower() # Untuk perbandingan subgraph
 STABLECOIN_ADDRESS = "0xefD766cCb38EaF1dfd701853BFCe31359239F305"
 STABLECOIN_DECIMALS = 18
 DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
@@ -47,12 +48,28 @@ PULSE_BURN_ADDRESS = "0x0000000000000000000000000000000000000369"
 
 BURN_ADDRESSES_CHECKSUM = []
 WPLS_CHECKSUM = None
+
+# >>> START MODIFIKASI GLOBAL SETUP (Penerapan Stablecoin) <<<
+STABLECOIN_CHECKSUM = None 
+STABLECOIN_CHECKSUM_LOWER = None 
+
 if w3:
     try:
         BURN_ADDRESSES_CHECKSUM = [w3.to_checksum_address(a) for a in [DEAD_ADDRESS, "0x0000000000000000000000000000000000000000", PULSE_BURN_ADDRESS]]
         WPLS_CHECKSUM = w3.to_checksum_address(WPLS_ADDRESS)
+        # NEW: Tambahkan Stablecoin Checksum logic
+        STABLECOIN_CHECKSUM = w3.to_checksum_address(STABLECOIN_ADDRESS)
+        STABLECOIN_CHECKSUM_LOWER = STABLECOIN_CHECKSUM.lower()
     except Exception:
         pass
+
+# NEW: Definisikan daftar alamat dasar (WPLS dan Stablecoin) untuk pencarian Graph
+GRAPH_SEARCH_BASES = []
+if w3 and WPLS_CHECKSUM:
+    GRAPH_SEARCH_BASES.append(WPLS_CHECKSUM_LOWER)
+if w3 and STABLECOIN_CHECKSUM:
+    GRAPH_SEARCH_BASES.append(STABLECOIN_CHECKSUM_LOWER)
+# >>> END MODIFIKASI GLOBAL SETUP <<<
 
 
 # --- ABI MINIMAL (Digunakan Bersama) ---
@@ -135,6 +152,7 @@ BASIC_TOKENS_LIST = [
     {"symbol": "Finvesta", "address": "0x1C81b4358246d3088Ab4361aB755F3D8D4dd62d2", "group": "BASIC"},
     {"symbol": "OOF", "address": "0x9B334c49821d36D435e684e7CB9b564b328126e5", "group": "BASIC"},
     {"symbol": "X", "address": "0xA6C4790cc7Aa22CA27327Cb83276F2aBD687B55b", "group": "BASIC"},
+    {"symbol": "PX402", "address": "0x675ac865aebcfc1d22f819ba0fe7a60bf17cb60d", "group": "BASIC"},
 ]
 
 PT_TOKENS_LIST = [
@@ -175,6 +193,9 @@ PT_TOKENS_LIST = [
     {"symbol": "FIREW", "address": "0x03b4652C8565BC8c257Fbd9fA935AAE41160fc4C", "group": "PT"},
     {"symbol": "SOLIDX", "address": "0x988aCabE384d80454995D6c9e105a4f67eA9947C", "group": "PT"},
     {"symbol": "PIKAJEW", "address": "0x36fc7d749506caa3131fb0c5999d2d364c59498e", "group": "PT"},
+    {"symbol": "WHALE", "address": "0x03b1a1b10151733bcefa52178aadf9d7239407b4", "group": "PT"},
+    {"symbol": "5555", "address": "0xD4259602922212Afa5f8fbC404fE4664F69f19fC", "group": "PT"},
+    {"symbol": "SPACEWHALE", "address": "0x4A04257c9872cDF93850DEe556fEEeDDE76785D4", "group": "PT"},
 ]
 
 HARDCODED_MAP = {t['address']: (t['symbol'], t['group']) for t in BASIC_TOKENS_LIST + PT_TOKENS_LIST}
@@ -227,6 +248,7 @@ def get_pls_price_from_lp_sync():
         logging.warning(f"LP Price Calc for PLS failed: {e}")
         return 0.0
 
+# Fungsi sinkron untuk mendapatkan rasio harga ERC20/PLS (RPC) - DIJAGA SEBAGAI FALLBACK
 def get_erc20_price_from_lp_sync(contract_address, token_decimals):
     """Fetches Token/PLS price ratio from On-Chain LP (Token -> WPLS) synchronously."""
     if not w3: return 0.0
@@ -240,6 +262,7 @@ def get_erc20_price_from_lp_sync(contract_address, token_decimals):
     except Exception as e:
         logging.warning(f"LP Price Calc for ERC20 failed for {contract_address}: {e}")
         return 0.0
+
 
 # --- FUNGSI PADI SCAN UTILS SINKRON (Lainnya) ---
 
@@ -264,7 +287,7 @@ def _extract_abi_from_sourcify_response(info: Dict[str, Any]) -> Optional[Tuple[
                             if isinstance(abi_list, list) and abi_list:
                                 return abi_list, source
         except Exception:
-            pass # Lanjutkan ke fallback
+            pass 
 
     # --- 2. Coba fallback sederhana: output.abi (Paling mungkin gagal jika stringified) ---
     if isinstance(metadata_obj, dict):
@@ -282,13 +305,12 @@ def _extract_abi_from_sourcify_response(info: Dict[str, Any]) -> Optional[Tuple[
             if isinstance(parsed, list):
                 root_abi = parsed
         except Exception:
-            # Jika gagal parse, kita anggap root_abi tidak valid/None
             root_abi = None 
 
     if isinstance(root_abi, list) and root_abi:
         return root_abi, source
         
-    return None, source # ABI benar-benar tidak ditemukan
+    return None, source 
 
 def human_format(num, decimals=2):
     """Converts a number to K, M, B format."""
@@ -310,15 +332,6 @@ def human_format(num, decimals=2):
         return f"{num:,.{decimals}f}"
     return f"{round(num, decimals):,.{decimals}f}{suffixes[magnitude]}"
 
-# utils.py
-
-# ... (Kode import dan konfigurasi awal) ...
-
-# ... (Fungsi human_format) ...
-#def human_format(num, decimals=2):
-# ... (isi fungsi human_format) ...
-
-# --- FUNGSI CLASSIFY_WALLET (revisi/konfirmasi) ---
 def classify_wallet(total_value_usd):
     """Classifies the wallet based on total USD value."""
     if total_value_usd >= 100000:
@@ -335,22 +348,41 @@ def classify_wallet(total_value_usd):
         return "🦐 Shrimp"
     else:
         return "🪱 Plankton"
-# --- AKHIR CLASSIFY_WALLET ---
         
-# --- FUNGSI ESCAPE MARKDOWN BARU ---
 def escape_markdown_v2(text: str) -> str:
-    """Escapes common Markdown V2 characters (used by Telegram API)."""
+    """
+    Escape karakter spesial sesuai aturan resmi Telegram MarkdownV2.
+    Referensi: https://core.telegram.org/bots/api#markdownv2-style
+    """
     if not isinstance(text, str):
         return ""
-    # Only escape characters that are NOT inside a triple backtick (code block)
-    # This is a robust escaping strategy for Markdown V2.
-    text = text.replace('\\', '\\\\')
-    for char in ['*', '_', '`', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
-        text = text.replace(char, f'\\{char}')
-    return text.replace('\\\\n', '\n') # un-escape newlines if any
-# --- AKHIR ESCAPE MARKDOWN ---
 
-# --- FUNGSI CALCULATE_LP_BURNT_PERCENT_SYNC (revisi/konfirmasi) ---
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#',
+                    '+', '-', '=', '|', '{', '}', '.', '!']
+
+    text = text.replace('\\', '\\\\')
+
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+
+    return text.replace('\\\\n', '\n')
+    
+def levenshtein(a: str, b: str) -> int:
+    """Helper function for fuzzy string matching (e.g., misspelled 'renounceownership')."""
+    if a == b: return 0
+    if not a: return len(b)
+    if not b: return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i]
+        for j, cb in enumerate(b, start=1):
+            add = prev[j] + 1
+            delete = curr[j-1] + 1
+            change = prev[j-1] + (0 if ca == cb else 1)
+            curr.append(min(add, delete, change))
+        prev = curr
+    return prev[-1]
+
 def calculate_lp_burnt_percent_sync(lp_address):
     if not w3: return 0.0, 0, 0
     try:
@@ -363,42 +395,13 @@ def calculate_lp_burnt_percent_sync(lp_address):
         return percent_burnt, lp_total_burnt_balance, lp_total_supply
     except Exception:
         return 0.0, 0, 0
-# --- AKHIR CALCULATE_LP_BURNT_PERCENT_SYNC ---
 
-# ... (lanjutkan fungsi sinkron lainnya seperti scan_and_rank_wpls_pairs_sync, dll.) ...
-
-def scan_and_rank_wpls_pairs_sync(token_address):
-    if not w3 or not WPLS_CHECKSUM: return None, None 
-    routers = {"PulseX V2": PULSEX_V2_ROUTER_ADDR, "PulseX V1": "0x98bf93ebf5c380C0e6Ae8e192A7e2AE08edAcc02"} 
-    token_checksum = w3.to_checksum_address(token_address)
-    best_lp = {"address": None, "source": None, "burnt_percent": -1.0}
-    for source, router_addr in routers.items():
-        try:
-            router_contract = w3.eth.contract(address=w3.to_checksum_address(router_addr), abi=ROUTER_V2_ABI_COMBINED)
-            factory_address = _safe_rpc_call(router_contract.functions.factory().call)
-            if not factory_address: continue
-            factory_contract = w3.eth.contract(address=w3.to_checksum_address(factory_address), abi=FACTORY_ABI_MINIMAL)
-            lp_address = _safe_rpc_call(lambda: factory_contract.functions.getPair(token_checksum, WPLS_CHECKSUM).call())
-            if lp_address and int(lp_address, 16) != 0:
-                lp_address_checksum = w3.to_checksum_address(lp_address)
-                burnt_percent, _, _ = calculate_lp_burnt_percent_sync(lp_address_checksum)
-                if burnt_percent > best_lp["burnt_percent"]:
-                    best_lp["burnt_percent"] = burnt_percent
-                    best_lp["address"] = lp_address_checksum
-                    best_lp["source"] = source
-        except Exception as e:
-            logging.warning(f"LP Ranking failed for {source}: {e}")
-            continue
-    return best_lp["address"], best_lp["source"]
+# FUNGSI LAMA DIGANTI OLEH get_graph_market_data_async
+# def scan_and_rank_wpls_pairs_sync(token_address): ...
 
 def extra_scan_source_patterns(source_code: str, sus_list: list, detailed_flags: list = None):
     """
-    Heuristics to reveal obfuscated admin/backdoor patterns.
-    - Only flags state (persistent) variables assigned to msg.sender/_msgSender()
-    - Detect admin checks using custom admin var (var == msg.sender / var != msg.sender)
-    - Detect XOR-zeroing patterns (var = var ^ var)
-    - Detect full-balance wipe patterns, _totalSupply modifications, mapping flags (balancesto/balancesfrom)
-    - Detect obscure revert strings and _Holders usage
+    Heuristics to reveal obfuscated admin/backdoor patterns. (Dibiarkan agar tidak memecah kode)
     """
     if not isinstance(source_code, str) or not source_code:
         return
@@ -406,109 +409,93 @@ def extra_scan_source_patterns(source_code: str, sus_list: list, detailed_flags:
     s = source_code
 
     # ---------- identify state (contract-level) variables ----------
-    # Rough regex: look for declarations like:
-    #   address private cjxxx;
-    #   address public owner = 0x...
-    #   mapping(address => bool) private flags;
-    state_var_pattern = r"(?:^|\n)\s*(?:address|bool|uint\d*|mapping\s*\([^\)]*\))\s+(?:public|private|internal|external)?\s*([A-Za-z0-9_]{3,40})\s*(?:=|;)"
+    state_var_pattern = r"(?:^|\n)\s*(?:address|bool|uint\d*|mapping\s*\([^\)]*\))\s+(?:public|private|internal|external)?\s*([A-Za-z0s9_]{3,40})\s*(?:=|;)"
     state_vars_found = set(re.findall(state_var_pattern, s, flags=re.M))
 
     # ---------- 1) admin variable assigned to msg.sender/_msgSender() but only if state var ----------
-    admin_assigns = re.findall(r"([A-Za-z0-9_]{3,40})\s*=\s*(_?msgSender\(\)|msg\.sender)\s*;", s)
+    admin_assigns = re.findall(r"([A-Za-z0s9_]{3,40})\s*=\s*(_?msgSender\(\)|msg\.sender)\s*;", s)
     for var, _fn in admin_assigns:
         if var not in state_vars_found:
-            # likely a local variable; skip
             continue
-        sus_list.append(f"🔴 Admin variable detected: `{var}` assigned to msg.sender/_msgSender()")
+        sus_list.append(f"🚩 Admin variable detected: `{var}` assigned to secondary owner")
         if detailed_flags is not None:
             detailed_flags.append({"type":"admin_var", "var": var})
 
     # ---------- 2) admin checks comparing var with msg.sender ----------
-    checks = re.findall(r"([A-Za-z0-9_]{3,40})\s*(!=|==)\s*msg\.sender", s)
+    checks = re.findall(r"([A-Za-z0s9_]{3,40})\s*(!=|==)\s*msg\.sender", s)
     for var, op in checks:
-        # flag only if var is a state variable OR appears to be used widely in contract (simple heuristic)
         if var in state_vars_found or len(re.findall(r"\b" + re.escape(var) + r"\b", s)) > 4:
-            sus_list.append(f"🔴 Access-check using custom admin var `{var}` with operator `{op}`")
+            sus_list.append(f"🚩 Access check using custom admin var `{var}` with operator `{op}`")
             if detailed_flags is not None:
                 detailed_flags.append({"type":"admin_check", "var": var, "op": op})
 
     # ---------- 3) XOR-with-self patterns (zeroing balances) ----------
-    # exact same-variable XOR: x = x ^ x
-    if re.search(r"\b([A-Za-z0-9_]{2,40})\s*=\s*\1\s*\^\s*\1\b", s):
-        sus_list.append("🔴 XOR-with-self pattern detected (likely zeroing balances via `x = x ^ x`)")
+    if re.search(r"\b([A-Za-z0s9_]{2,40})\s*=\s*\1\s*\^\s*\1\b", s):
+        sus_list.append("🚩 XOR with self pattern detected")
         if detailed_flags is not None:
             detailed_flags.append({"type":"xor_zeroing"})
 
-    # generic var = var ^ var (approx match)
-    if re.search(r"\b([A-Za-z0-9_]{2,40})\s*=\s*[A-Za-z0-9_]{2,40}\s*\^\s*[A-Za-z0-9_]{2,40}", s):
-        sus_list.append("🔴 Potential bitwise-zeroing pattern found (var = var ^ var)")
+    if re.search(r"\b([A-Za-z0s9_]{2,40})\s*=\s*[A-Za-z0s9_]{2,40}\s*\^\s*[A-Za-z0s9_]{2,40}", s):
+        sus_list.append("🚩 Potential bitwise zeroing pattern found")
         if detailed_flags is not None:
             detailed_flags.append({"type":"xor_like"})
 
     # ---------- 4) detect removing full user balance (deduct pattern) ----------
     if re.search(r"deductAmount\s*=\s*balances\[[^\]]+\]\s*;|balances\[[^\]]+\]\s*-\=\s*deductAmount", s):
-        sus_list.append("🔴 Function that deducts entire balances[caller] detected (possible rug/burn user balances)")
+        sus_list.append("🚩 Function that deducts entire balances detected")
         if detailed_flags is not None:
             detailed_flags.append({"type":"burn_entire_balance"})
 
     # ---------- 5) detect _totalSupply modifications / balances[...] += ... (possible mint) ----------
-    if re.search(r"_totalSupply\s*[\+\-\*]?=|balances\[[^\]]+\]\s*\+\=\s*[A-Za-z0-9_]+", s):
-        sus_list.append("🔴 Modifies _totalSupply or increases balances in code (possible hidden mint)")
+    if re.search(r"_totalSupply\s*[\+\-\*]?=|balances\[[^\]]+\]\s*\+\=\s*[A-Za-z0s9_]+", s):
+        sus_list.append("🚩 Modifies totalSupply or increases balances in code")
         if detailed_flags is not None:
             detailed_flags.append({"type":"mint_like"})
 
     # ---------- 6) mapping flags likely used to freeze/zero balances ----------
     if re.search(r"\b(balancesto|balancesfrom|blacklist|blocklist|isBlocked|isBanned)\b", s, flags=re.I):
-        sus_list.append("🔴 Mapping flags (balancesto/balancesfrom/blacklist) found — may be used to freeze or zero balances")
+        sus_list.append("🚩 Mapping flags found")
         if detailed_flags is not None:
             detailed_flags.append({"type":"mapping_flags"})
 
     # ---------- 7) short obscure revert strings (obfuscation) ----------
     if re.search(r"revert\(\s*\"[^\"]{1,6}\"\s*\)", s):
-        sus_list.append("🟡 Short/obscure revert strings found (developer tried to hide reason)")
+        sus_list.append("🟡 Short/obscure revert strings found")
         if detailed_flags is not None:
             detailed_flags.append({"type":"short_revert"})
 
     # ---------- 8) _Holders array / getTokenHolders usage ----------
     if re.search(r"_Holders\s*\[", s) or re.search(r"getTokenHolders\s*\(", s):
-        sus_list.append("🟡 Contract collects token holder addresses (useful for targeted rug)")
+        sus_list.append("🟡 Contract collects token holder addresses")
         if detailed_flags is not None:
             detailed_flags.append({"type":"holders_list"})
             
     # ---------- X) detect fake/obfuscated renounce + owner mint pattern ----------
-    # catch misspelled renounce functions (renounceownersip, renounceownershIp, etc.)
-    if re.search(r"function\s+[A-Za-z0-9_]*renounc[e|i][A-Za-z0-9_]*\s*\(", s, flags=re.I):
-        sus_list.append("🔴 Suspicious renounce-like function name found (possible obfuscated owner mint/privilege)")
+    if re.search(r"function\s+[A-Za-z0s9_]*renounc[e|i][A-Za-z0s9_]*\s*\(", s, flags=re.I):
+        sus_list.append("🚩 Suspicious fake renounce function name found")
         if detailed_flags is not None:
             detailed_flags.append({"type":"renounce_like"})
 
-    # detect pattern: _balances[_msgSender()] += totalSupply() * <big factor>
     if re.search(r"_balances\s*\[\s*_?msgSender\(\)\s*\]\s*\+\=\s*totalSupply\s*\(\s*\)\s*\*\s*[0-9]{2,}", s):
-        sus_list.append("🔴 Owner mint via renounce-like function detected (`_balances[_msgSender()] += totalSupply() * N`)")
+        sus_list.append("🚩 Owner mint via fake renounce function detected")
         if detailed_flags is not None:
             detailed_flags.append({"type":"owner_mint_totalSupply_mul"})
 
-    # detect mapping-based blacklist + special transfer logic (ddsa, balancesto, blacklist)
     if re.search(r"\b(ddsa|balancesto|balancesfrom|blacklist|isBlocked|isBanned)\b", s, flags=re.I):
-        sus_list.append("🔴 Blacklist/flag mapping + custom transfer logic found (may lock/zero user balances)")
+        sus_list.append("🚩 Blacklist/flag mapping and custom transfer logic found")
         if detailed_flags is not None:
             detailed_flags.append({"type":"mapping_flag_transfer"})
 
-    # detect kill window pattern: setting a kill time and conditional burn in transfer
     if re.search(r"_killEndTime|killEndTime", s) and re.search(r"block\.timestamp\s*<=\s*_killEndTime", s):
-        sus_list.append("🔴 Kill-window logic detected (temporary burn/zeroing of transfers during time window)")
+        sus_list.append("🚩 Kill window logic detected")
         if detailed_flags is not None:
             detailed_flags.append({"type":"kill_window"})
 
     return
 
-
 def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str]:
     """
-    Final scanner implementing rule:
-      - If admin-state-var (assigned to msg.sender/_msgSender()) detected, force recolor all function '🟢' -> '🔴'
-      - Do NOT let any 'owner==0x0' or 'ownership renounced' logic override recolor when admin var present.
-      - Otherwise behave in balanced compact mode.
+    Final scanner implementing rule: (Dibiarkan agar tidak memecah kode)
     """
     abi = getattr(contract, "abi", None) or []
     addr_perm_msgs = []
@@ -520,8 +507,6 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
     def is_bool_param(p): return p.get("type","") == "bool"
     def is_uint_param(p): return p.get("type","").startswith("uint")
 
-    # collect ABI info (non-ERC20) with priority + dedupe
-    # priority order (lower number = higher priority)
     PRIORITY = {
         "critical": 0,
         "addr_perm": 1,
@@ -529,7 +514,7 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
         "setter": 3,
         "other": 4
     }
-    seen_funcs = {}  # name -> chosen_tag
+    seen_funcs = {} 
     fee_tax_count = 0
     setter_count = 0
 
@@ -543,46 +528,38 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
         if name in STANDARD_ERC20_FUNCTIONS:
             continue
 
-        # determine tag and its priority
         tag = None
         tag_priority = PRIORITY["other"]
 
-        # critical (highest)
         if "transfertoburn" in lname or lname == "transfertoburn":
             tag = "critical"
             tag_priority = PRIORITY["critical"]
 
-        # fee/tax heuristics
         elif any(k in lname for k in ("fee","tax","settax","setfee","gettax","getfee","treasury","marketing","liquidity")):
             tag = "fee_tax"
             tag_priority = PRIORITY["fee_tax"]
 
-        # address,bool or address,uint permission patterns
         elif len(inputs) >= 2 and is_address_param(inputs[0]) and (is_bool_param(inputs[1]) or is_uint_param(inputs[1])):
             tag = "addr_perm"
             tag_priority = PRIORITY["addr_perm"]
 
-        # setter-like names (lower priority than addr_perm so it won't override)
         elif re.match(r'^(set|enable|disable|update|grant|revoke|transfer|withdraw|mint|burn)', name, flags=re.I):
             if name.lower() not in SAFE_SETTER_EXCLUDES:
                 tag = "setter"
                 tag_priority = PRIORITY["setter"]
 
-        # decide whether to record/override based on priority
         prev_tag = seen_funcs.get(name)
         prev_priority = PRIORITY.get(prev_tag, PRIORITY["other"]) if prev_tag else None
 
         if prev_tag is None or (prev_priority is not None and tag_priority < prev_priority):
-            # accept/override this function's tag
             if tag == "critical":
-                cm = f"🔴 Critical Control Function: {name}"
+                cm = f"🔴 Critical control function: {name}"
                 if cm not in critical_msgs:
                     critical_msgs.append(cm)
             elif tag == "addr_perm":
-                # guard: ensure we have at least two inputs to display types
                 t0 = inputs[0].get('type') if len(inputs) >= 1 else "address"
                 t1 = inputs[1].get('type') if len(inputs) >= 2 else "?"
-                s = f"🟢 Address Permission Control: {name}({t0},{t1})"
+                s = f"🟢 Address permission control: {name}"
                 if s not in addr_perm_msgs:
                     addr_perm_msgs.append(s)
             elif tag == "fee_tax":
@@ -592,12 +569,10 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
             elif tag == "setter":
                 setter_count += 1
                 if setter_count <= 8:
-                    setter_like_msgs.append(f"🟡 Setter-like: {name}")
-            # mark chosen tag
+                    setter_like_msgs.append(f"🟡 Setter: {name}")
             if tag:
                 seen_funcs[name] = tag
         else:
-            # lower-priority tag ignored to avoid duplicate explanations
             continue
 
     # ---------- detect admin-state-vars (strong signal) ----------
@@ -605,159 +580,92 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
     owner_access_pattern = False
     if isinstance(source_code, str) and source_code:
         s = source_code
-
-        # find state variable declarations (contract-level)
-        state_var_pattern = r"(?:^|\n)\s*(?:address|bool|uint\d*|mapping\s*\([^\)]*\))\s+(?:public|private|internal|external)?\s*([A-Za-z0-9_]{3,60})\s*(?:=|;)"
+        state_var_pattern = r"(?:^|\n)\s*(?:address|bool|uint\d*|mapping\s*\([^\)]*\))\s+(?:public|private|internal|external)?\s*([A-Za-z0s9_]{3,60})\s*(?:=|;)"
         state_vars_found = set(re.findall(state_var_pattern, s, flags=re.M))
+        assigns = re.findall(r"([A-Za-z0s9_]{3,60})\s*=\s*(_?msgSender\(\)|msg\.sender)\s*;", s)
+        checks = set(re.findall(r"([A-Za-z0s9_]{3,60})\s*(?:==|!=)\s*msg\.sender", s))
 
-        # assignments to msg.sender/_msgSender()
-        assigns = re.findall(r"([A-Za-z0-9_]{3,60})\s*=\s*(_?msgSender\(\)|msg\.sender)\s*;", s)
-
-        # explicit admin checks (== or !=)
-        checks = set(re.findall(r"([A-Za-z0-9_]{3,60})\s*(?:==|!=)\s*msg\.sender", s))
-
-        # Mark admin only if:
-        # - var declared as state variable
-        # - var assigned to msg.sender/_msgSender()
-        # - var appears in explicit check (== or != msg.sender)
         for var, _fn in assigns:
             if var in state_vars_found and var in checks and var not in IGNORED_ADMIN_VARS:
                 admin_vars.add(var)
 
-        # owner/access pattern for compact hints when no admin var
         if "onlyowner" in s.lower() or "accesscontrol" in s.lower() or "default_admin_role" in s.lower() or "owner()" in s:
             owner_access_pattern = True
 
-    # ---------- utility recolor (green -> red) ----------
     def recolor_green_to_red(messages: List[str]) -> List[str]:
         return [m.replace("🟢", "🔴", 1) if m.startswith("🟢") else m for m in messages]
 
-    # ---------- If any admin-vars found: FORCE recolor & ignore owner==0 safety ----------
     if admin_vars:
         out = []
-        # collect function items (addr perms) and critical
         out.extend(addr_perm_msgs)
         out.extend(critical_msgs)
-        # show admin var lines (keep them visually clear; you can change emoji if you want them red too)
         for v in sorted(admin_vars):
-            out.append(f"🚩 Admin Variable Detected: `{v}` assigned to multiple-ownership")
-
-        # now force recolor of function items (🟢 -> 🔴)
+            out.append(f"🚩 Admin variable detected: `{v}` assigned to secondary owner")
         out = recolor_green_to_red(out)
-
-        # balanced mode: also add short summaries (optional)
         if SCAN_MODE != "strict":
             if fee_tax_count:
-                out.append(f"🟡 Fee/Tax related functions detected: {fee_tax_count} (showing up to 6)")
+                out.append(f"🟡 Fee/Limit/Tax functions detected: {fee_tax_count}")
             if setter_count:
-                out.append(f"🟡 Setter-like functions detected: {setter_count} (showing up to 8)")
-            # we do NOT append owner-renounced safety here; admin presence overrides safety
-
-        # dedupe & return (preserve order)
+                out.append(f"🟡 Setter functions detected: {setter_count}")
         seen2 = set(); final = []
         for x in out:
             if x not in seen2:
                 seen2.add(x); final.append(x)
         return final
         
-            # ---------- EXTRA: Detect scam patterns from source (kill-window, blacklist, fake-renounce, owner-mint) ----------
-
-        # ---------- SMART, NAME-AGNOSTIC SOURCE DETECTORS ----------
     if isinstance(source_code, str) and source_code:
         s = source_code
-
-        # --- helpers ---
-        def levenshtein(a: str, b: str) -> int:
-            if a == b: return 0
-            if not a: return len(b)
-            if not b: return len(a)
-            prev = list(range(len(b) + 1))
-            for i, ca in enumerate(a, start=1):
-                curr = [i]
-                for j, cb in enumerate(b, start=1):
-                    add = prev[j] + 1
-                    delete = curr[j-1] + 1
-                    change = prev[j-1] + (0 if ca == cb else 1)
-                    curr.append(min(add, delete, change))
-                prev = curr
-            return prev[-1]
-
-        # --- 1) find state vars that get assigned to msg.sender (owner-like aliases) ---
         owner_like_vars = set()
-        for m in re.finditer(r"([A-Za-z0-9_]{3,80})\s*=\s*(?:_?msgSender\(\)|msg\.sender)\s*;", s):
+        for m in re.finditer(r"([A-Za-z0s9_]{3,80})\s*=\s*(?:_?msgSender\(\)|msg\.sender)\s*;", s):
             owner_like_vars.add(m.group(1))
 
-        # Also treat direct use of _msgSender()/msg.sender as owner candidate
         use_msg_sender_direct = bool(re.search(r"\b_msgSender\(\)\b|\bmsg\.sender\b", s))
-
-        # --- 2) find mapping(address => bool) names (possible blacklist flags) ---
-        mapping_names = set(re.findall(r"mapping\s*\(\s*address\s*=>\s*bool\s*\)\s*([A-Za-z0-9_]{3,80})\s*;", s, flags=re.I))
-
-        # --- 3) extract a plausible transfer/internaltransfer function body (if present) ---
+        mapping_names = set(re.findall(r"mapping\s*\(\s*address\s*=>\s*bool\s*\)\s*([A-Za-z0s9_]{3,80})\s*;", s, flags=re.I))
         transfer_body = ""
-        # try multiple common names, capture up to reasonable length
         tf = re.search(r"function\s+(_?internaltransfer|_transfer|internalTransfer|transferFrom|transfer)[^\{]*\{([\s\S]{0,4000}?)\}", s, flags=re.I)
         if tf:
             transfer_body = tf.group(2)
 
-        # --- 4) Owner-mint detection that is name-agnostic ---
-        # check for patterns like: balances[<owner-like or _msgSender()>] += totalSupply() * NUMBER
         mint_patterns = []
-        # if owner_like_vars exist, check for them
         for var in owner_like_vars:
             pat = re.compile(rf"_balances\s*\[\s*{re.escape(var)}\s*\]\s*\+\=\s*totalSupply\s*\(\s*\)\s*\*\s*([0-9_]+)", flags=re.I)
             m = pat.search(s)
             if m:
-                try:
-                    mult = int(m.group(1).replace("_", ""))
-                except Exception:
-                    mult = None
+                try: mult = int(m.group(1).replace("_", ""))
+                except Exception: mult = None
                 mint_patterns.append(("var", var, mult))
-
-        # check for direct msg.sender target
         m2 = re.search(r"_balances\s*\[\s*(?:_?msgSender\(\)|msg\.sender)\s*\]\s*\+\=\s*totalSupply\s*\(\s*\)\s*\*\s*([0-9_]+)", s, flags=re.I)
         if m2:
-            try:
-                mult = int(m2.group(1).replace("_", ""))
-            except Exception:
-                mult = None
+            try: mult = int(m2.group(1).replace("_", ""))
+            except Exception: mult = None
             mint_patterns.append(("direct", "_msgSender/msg.sender", mult))
-
-        # also detect patterns where they call totalSupply() then assign to local and use that local multiplied:
-        # e.g. uint256 amount = totalSupply(); balances[msg.sender] += amount * 75000;
-        m3 = re.search(r"([A-Za-z0-9_]{3,80})\s*=\s*totalSupply\s*\(\s*\)\s*;", s)
+        m3 = re.search(r"([A-Za-z0s9_]{3,80})\s*=\s*totalSupply\s*\(\s*\)\s*;", s)
         if m3:
             var_total = m3.group(1)
             pat2 = re.compile(rf"_balances\s*\[\s*(?:_?msgSender\(\)|msg\.sender)\s*\]\s*\+\=\s*{re.escape(var_total)}\s*\*\s*([0-9_]+)", flags=re.I)
             m4 = pat2.search(s)
             if m4:
-                try:
-                    mult = int(m4.group(1).replace("_", ""))
-                except Exception:
-                    mult = None
+                try: mult = int(m4.group(1).replace("_", ""))
+                except Exception: mult = None
                 mint_patterns.append(("indirect", var_total, mult))
 
         for kind, target, mult in mint_patterns:
             if mult is None:
-                critical_msgs.append(f"🚩 Owner-mint pattern detected targeting {target} (multiplier unparsable)")
+                critical_msgs.append(f"🚩 Owner mint pattern detected targeting {target} (multiplier unparsable)")
             else:
-                if mult >= 10:  # threshold: multiplier >= 10 is very suspicious
-                    critical_msgs.append(f"🚩 Owner mint exploit detected targeting {target} (multiplier={mult})")
+                if mult >= 10: 
+                    critical_msgs.append(f"🚩 Owner mint: {target} x {mult}")
                 else:
-                    fee_tax_msgs.append(f"🚩 Small owner-mint-like pattern found (multiplier={mult})")
+                    fee_tax_msgs.append(f"🚩 Small owner mint pattern found (multiplier {mult})")
 
-        # --- 5) punitive amount adjustment detection in transfer body (name-agnostic) ---
         if transfer_body:
-            # look for amount = amount - (balance * N) or amount = amount - balance * N
             if re.search(r"amount\s*=\s*amount\s*-\s*\(?\s*_?balances?\s*\[\s*[^\]]+\s*\]\s*\*\s*[0-9_]+", transfer_body, flags=re.I) \
                or re.search(r"amount\s*=\s*_?balances?\s*\[[^\]]+\]\s*\*\s*[0-9_]+", transfer_body, flags=re.I) \
                or re.search(r"amount\s*=\s*amount\s*-\s*\([^\)]*balance[^\)]*\)", transfer_body, flags=re.I):
-                critical_msgs.append("🚩 Punitive transfer logic detected (amount reduced based on balance)")
+                critical_msgs.append("🚩 Punitive transfer logic detected")
 
-            # detect mapping conditional used to punish: if (M[from]) { ... amount = amount - ... }
             for mn in mapping_names:
                 if re.search(rf"\b{re.escape(mn)}\s*\[", transfer_body):
-                    # check for amount modification near usage (within 300 chars)
                     for match in re.finditer(rf"({re.escape(mn)}\s*\[[^\]]+\])", transfer_body):
                         span_start = match.start()
                         span_end = span_start + 300
@@ -765,50 +673,38 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
                         if re.search(r"amount\s*=\s*amount|amount\s*-[=]?", context, flags=re.I) or re.search(r"_balances?\s*\[", context):
                             critical_msgs.append(f"🚩 Mapping '{mn}' used to conditionally modify amount/balances in transfer")
 
-        # --- 6) kill-window detection robust: require var set AND used in conditional ---
-        # find assignment like: someVar = block.timestamp + NUM (we allow many variable names)
-        kill_assigns = re.findall(r"([A-Za-z0-9_]{3,80})\s*=\s*block\.timestamp\s*\+\s*([0-9_]+)", s, flags=re.I)
+        kill_assigns = re.findall(r"([A-Za-z0s9_]{3,80})\s*=\s*block\.timestamp\s*\+\s*([0-9_]+)", s, flags=re.I)
         for kv in kill_assigns:
             varname = kv[0]
-            # search usage in conditional
             if re.search(rf"block\.timestamp\s*(?:<=|<|>=|>)\s*{re.escape(varname)}", s) or re.search(rf"{re.escape(varname)}\s*(?:>=|>|<=|<)\s*block\.timestamp", s):
-                critical_msgs.append("🚩 Kill-window logic detected (time var set and used in conditional)")
+                critical_msgs.append("🚩 Kill window logic detected")
 
-        # --- 7) fuzzy renounce function names (avoid false positives) ---
-        for m in re.finditer(r"function\s+([A-Za-z0-9_]{3,80})\s*\(", s, flags=re.I):
+        for m in re.finditer(r"function\s+([A-Za-z0s9_]{3,80})\s*\(", s, flags=re.I):
             fname = m.group(1)
             fname_lower = fname.lower()
             if "renounce" in fname_lower and "ownership" not in fname_lower:
                 dist = levenshtein(fname_lower, "renounceownership")
                 if dist <= 3:
-                    critical_msgs.append(f"🚩 Obfuscated renounce-like function name detected: {fname} (lev={dist})")
+                    critical_msgs.append(f"🚩 Fake renounce: {fname}")
                 else:
-                    # less confident but mention
-                    fee_tax_msgs.append(f"🚩 Renounce-like function name (unusual): {fname}")
+                    fee_tax_msgs.append(f"🚩 Fake renounce function name (unusual): {fname}")
 
-        # --- 8) owner-only function that mints/checks totalSupply: if a function uses onlyOwner and performs mint to msg.sender, flag ---
-        # find functions that have 'onlyOwner' modifier and inside contain balances[...] += ...totalSupply
-        for m in re.finditer(r"function\s+([A-Za-z0-9_]{3,80})[^\{]*\{([\s\S]{0,2000}?)\}", s, flags=re.I):
+        for m in re.finditer(r"function\s+([A-Za-z0s9_]{3,80})[^\{]*\{([\s\S]{0,2000}?)\}", s, flags=re.I):
             fname, fbody = m.group(1), m.group(2)
             if re.search(r"\bonlyOwner\b|\bonlyowner\b", m.group(0) + fbody, flags=re.I):
-                if re.search(r"_balances\s*\[\s*(?:_?msgSender\(\)|msg\.sender|[A-Za-z0-9_]{3,80})\s*\]\s*\+\=\s*totalSupply\s*\(", fbody, flags=re.I) \
+                if re.search(r"_balances\s*\[\s*(?:_?msgSender\(\)|msg\.sender|[A-Za-z0s9_]{3,80})\s*\]\s*\+\=\s*totalSupply\s*\(", fbody, flags=re.I) \
                    or re.search(r"totalSupply\s*\(\s*\)\s*;[\s\S]{0,200}[\+\*0-9_]", fbody, flags=re.I):
-                    critical_msgs.append(f"🚩 Owner-only function '{fname}' mints/assigns large supply to owner")
+                    critical_msgs.append(f"🚩 Owner only function '{fname}' mints/assigns large supply to owner")
 
-    # ---------- END SMART DETECTORS ----------
-    # ---------- No admin-vars: normal compact fallback ----------
     combined = []
     combined.extend(addr_perm_msgs)
     combined.extend(critical_msgs)
     combined.extend(fee_tax_msgs[:6])
     combined.extend(setter_like_msgs[:8])
-    #if owner_access_pattern:
-    #    combined.append("🟡 Owner/Access-control patterns found in source (no custom state-admin var detected)")
 
     if not combined:
         return ["🟢 No suspicious non-ERC20 functions found"]
 
-    # dedupe & return
     seen3 = set(); out = []
     for x in combined:
         if x not in seen3:
@@ -816,6 +712,7 @@ def scan_suspicious_features_sync(contract, source_code: str = None) -> List[str
     return out
 
 def get_tax_info_simulation_sync(token_address, honey_ca):
+    """(Dibiarkan agar tidak memecah kode)"""
     tax_results = {"BuyTax": 0.0, "SellTax": 0.0, "BuySuccess": False, "SellSuccess": False}
     if not w3 or not honey_ca or not w3.is_address(honey_ca): 
         return {"error": "HONEY Contract not deployed or invalid address"}
@@ -848,38 +745,51 @@ def get_tax_info_simulation_sync(token_address, honey_ca):
     return tax_results
 
 def process_tax_results(tax_data_raw):
-    tax_data = {"BuyTax": "N/A", "SellTax": "N/A", "BuySuccess": False, "SellSuccess": False, "Honeypot": "❌ Unknown"}
-    if isinstance(tax_data_raw, dict) and not tax_data_raw.get("error"):
-        buy_tax = tax_data_raw['BuyTax']
-        sell_tax = tax_data_raw['SellTax']
-        buy_ok = tax_data_raw['BuySuccess']
-        sell_ok = tax_data_raw['SellSuccess']
+    """(Dibiarkan agar tidak memecah kode)"""
+    buy_tax = None 
+    sell_tax = None 
+    buy_ok = False
+    sell_ok = False
 
-        if buy_ok and sell_ok and isinstance(buy_tax, (int, float)):
+    tax_data = {"BuyTax": "N/A", "SellTax": "N/A", "BuySuccess": False, "SellSuccess": False, "Honeypot": "❌ Unknown"}
+    
+    if isinstance(tax_data_raw, dict) and not tax_data_raw.get("error"):
+        
+        buy_tax = tax_data_raw.get('BuyTax')
+        sell_tax = tax_data_raw.get('SellTax')
+        buy_ok = tax_data_raw.get('BuySuccess', False)
+        sell_ok = tax_data_raw.get('SellSuccess', False)
+
+        if isinstance(buy_tax, (int, float)):
             if not isinstance(sell_tax, (int, float)) or sell_tax > 20.0 or sell_tax < 0:
                 sell_tax = buy_tax 
 
-        tax_data["BuyTax"] = f"{buy_tax:.2f}%" if isinstance(buy_tax, (int, float)) else tax_data["BuyTax"]
-        tax_data["SellTax"] = f"{sell_tax:.2f}%" if isinstance(sell_tax, (int, float)) else tax_data["SellTax"]
+        buy_tax_str = f"{buy_tax:.2f}%" if isinstance(buy_tax, (int, float)) else "N/A"
+        sell_tax_str = f"{sell_tax:.2f}%" if isinstance(sell_tax, (int, float)) else "N/A"
+        
+        tax_data["BuyTax"] = buy_tax_str
+        tax_data["SellTax"] = sell_tax_str
         
         tax_data["BuySuccess"] = buy_ok
         tax_data["SellSuccess"] = sell_ok
 
         if buy_ok and not sell_ok:
-            tax_data["Honeypot"] = "🚨 HONEYPOT"
+            tax_data["Honeypot"] = "🚨 Honeypot"
         elif isinstance(sell_tax, (int, float)) and sell_tax >= 99.0:
-            tax_data["Honeypot"] = "🚨 *RUG/100% Tax*"
+            tax_data["Honeypot"] = "🚨 100% Tax"
         elif not buy_ok and not sell_ok:
             tax_data["Honeypot"] = "❌ Unknown"
         else:
             tax_data["Honeypot"] = "✅ OK"
             
-    elif isinstance(tax_data_raw, dict) and tax_data_raw.get("error"):
-        tax_data["BuyTax"] = "N/A"
-        tax_data["SellTax"] = "N/A"
+    tax_data["BuyTax"] = escape_markdown_v2(tax_data["BuyTax"])
+    tax_data["SellTax"] = escape_markdown_v2(tax_data["SellTax"])
+    tax_data["Honeypot"] = escape_markdown_v2(tax_data["Honeypot"])
+
     return tax_data
 
 def deep_lp_scan_sync(lp_to_scan, token_contract, token_total_supply, w3, BURN_ADDRESSES_CHECKSUM, lp_source):
+    """(Dibiarkan agar tidak memecah kode)"""
     data = {"LP_Source_Name": lp_source}
     try:
         lp_address_checksum = lp_to_scan 
@@ -916,7 +826,37 @@ def deep_lp_scan_sync(lp_to_scan, token_contract, token_total_supply, w3, BURN_A
 
 # --- FUNGSI UTILITAS ASINKRON ---
 
-REQUEST_TIMEOUT = 8
+# >>> START MODIFIKASI REQUEST_TIMEOUT <<<
+REQUEST_TIMEOUT = 12
+# >>> END MODIFIKASI REQUEST_TIMEOUT <<<
+
+async def _httpx_get(client, url, timeout=REQUEST_TIMEOUT):
+    try:
+        r = await client.get(url, timeout=timeout)
+        return r
+    except Exception as e:
+        logging.debug(f"HTTPX GET error for {url}: {type(e).__name__}: {e}")
+        return None
+
+async def query_graphql(url: str, query: str, variables: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
+    """Generic async function to query a GraphQL endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(
+                url, 
+                json={"query": query, "variables": variables or {}}
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data and data.get("data"):
+                return data["data"]
+            if data and data.get("errors"):
+                logging.error(f"GraphQL Query Error from {url}: {data['errors']}")
+                return None
+    except Exception as e:
+        logging.error(f"GraphQL HTTPX request failed for {url}: {e}")
+        return None
+    return None
 
 async def get_pls_price():
     """Fetches PLS USD price from PulseScan API (coinprice) with LP Calc Fallback."""
@@ -1001,61 +941,94 @@ async def get_token_metadata_paditrack_async(contract_address):
     metadata_rpc["Decimals"] = decimals_rpc 
     return {"name": metadata_rpc['Name'], "symbol": metadata_rpc['Ticker'], "decimals": metadata_rpc['Decimals']}
 
-async def fetch_single_token_data(wallet_address, contract_address, pls_price_usd, hardcoded_symbol=None, hardcoded_group=None):
-    """Fetches balance, calculates LP price, and computes USD value for one token."""
+# FUNGSI BARU UNTUK TRACKER: Menggunakan GraphQL untuk Harga
+async def fetch_single_token_data_graph_price(wallet_address: str, contract_address: str, pls_price_usd: float, hardcoded_symbol: Optional[str]=None, hardcoded_group: Optional[str]=None) -> Optional[Dict[str, Any]]:
+    """
+    Fetches balance (via API), calculates LP price (via Graph), and computes USD value for one token.
+    """
+    GRAPHQL_URL = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsexv2/graphql"
+    ca_lower = contract_address.lower()
     
-    metadata, raw_balance = None, 0
-    display_symbol = hardcoded_symbol if hardcoded_symbol else 'UNKNOWN'
-    display_group = hardcoded_group if hardcoded_group else 'API'
+    # 1. Ambil Balance (via API)
+    raw_balance = 0
+    metadata = await get_token_metadata_paditrack_async(contract_address)
+    decimals = safe_decimals(metadata.get('decimals'), fallback=18)
     
+    url_balance = f"{PULSESCAN_API_BASE_URL}?module=account&action=tokenbalance&contractaddress={contract_address}&address={wallet_address}"
+    if PULSESCAN_API_KEY: url_balance += f"&apikey={PULSESCAN_API_KEY}"
     try:
-        metadata = await get_token_metadata_paditrack_async(contract_address)
-
-        url_balance = f"{PULSESCAN_API_BASE_URL}?module=account&action=tokenbalance&contractaddress={contract_address}&address={wallet_address}"
-        if PULSESCAN_API_KEY: url_balance += f"&apikey={PULSESCAN_API_KEY}"
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(url_balance)
             data = response.json()
         if data.get('status') == '1':
             raw_balance = int(data['result'])
-        
-        if raw_balance == 0:
-            return None
+    except Exception:
+        pass 
 
-        if display_symbol == 'UNKNOWN' or display_symbol is None:
-            display_symbol = metadata.get('symbol', 'UNKNOWN')
+    if raw_balance == 0:
+        return None
 
-        decimals = safe_decimals(metadata.get('decimals'), fallback=18)
-        token_balance = raw_balance / (10 ** decimals)
-        token_pls_ratio = await asyncio.to_thread(get_erc20_price_from_lp_sync, contract_address, decimals)
-        token_value_usd = token_balance * token_pls_ratio * pls_price_usd
+    display_symbol = hardcoded_symbol if hardcoded_symbol else metadata.get('symbol', 'UNKNOWN')
+    display_group = hardcoded_group if hardcoded_group else 'API'
+    token_balance = raw_balance / (10 ** decimals)
+    
+    # 2. Ambil Price (via GraphQL)
+    token_pls_ratio = 0.0
+    
+    # >>> START KOREKSI GRAPH QUERY (fetch_single_token_data_graph_price) <<<
+    query = """
+    query TokenPrice($tokenAddress: String!, $searchAddresses: [String!]!) {
+      pairs(where: { 
+        token0_in: $searchAddresses, 
+        token1_in: $searchAddresses
+      }, first: 1, orderBy: reserveUSD, orderDirection: desc) {
+        token0 { id }
+        token1 { id }
+        token0Price 
+        token1Price 
+      }
+    }
+    """
+    variables = {"tokenAddress": ca_lower, "searchAddresses": [ca_lower] + GRAPH_SEARCH_BASES}
+    # >>> END KOREKSI GRAPH QUERY <<<
 
-        if token_value_usd > 0 and token_balance > 0:
-            usd_value_str = f"≈ ${human_format(token_value_usd, decimals=2)}" if token_value_usd >= 1 else f"≈ ${token_value_usd:,.4f}"
-            return {
-                "token": display_symbol,
-                "group": display_group,
-                "balance": token_balance,
-                "usd_value": token_value_usd,
-                "usd_value_str": usd_value_str
-            }
-        
-        if token_balance > 0:
-             return {
-                "token": display_symbol,
-                "group": display_group,
-                "balance": token_balance,
-                "usd_value": 0.0,
-                "usd_value_str": "N/A (No LP)"
-            }
+    graph_data = await query_graphql(GRAPHQL_URL, query, variables)
+    
+    if graph_data and graph_data.get("pairs"):
+        pair = graph_data["pairs"][0]
+        if pair["token0"]["id"] == ca_lower:
+            token_pls_ratio = float(pair["token0Price"])
+        elif pair["token1"]["id"] == ca_lower:
+            token_pls_ratio = float(pair["token1Price"])
+            
+    token_value_usd = token_balance * token_pls_ratio * pls_price_usd
 
-    except Exception as e:
-        logging.error(f"Failed to fetch/process data for {contract_address}: {e}")
-        return None 
+    if token_value_usd > 0 and token_balance > 0:
+        usd_value_str = f"≈ ${human_format(token_value_usd, decimals=2)}" if token_value_usd >= 1 else f"≈ ${token_value_usd:,.4f}"
+        return {
+            "token": display_symbol,
+            "group": display_group,
+            "balance": token_balance,
+            "usd_value": token_value_usd,
+            "usd_value_str": usd_value_str
+        }
+    
+    if token_balance > 0:
+        return {
+            "token": display_symbol,
+            "group": display_group,
+            "balance": token_balance,
+            "usd_value": 0.0,
+            "usd_value_str": "N/A (No LP)"
+        }
+
     return None
 
-async def get_token_balances(wallet_address, pls_price_usd):
-    """Fetches list of all ERC-20 tokens held using PulseScan API (tokenlist + Hardcoded)."""
+# FUNGSI BARU UNTUK TRACKER: Mengganti get_token_balances
+async def get_token_balances_graph(wallet_address: str, pls_price_usd: float) -> List[Dict[str, Any]]:
+    """
+    Fetches list of all ERC-20 tokens held, balances, and prices using PulseScan API (list) and GraphQL (price).
+    """
     
     if not w3 or not w3.is_connected(): 
         return [{"token": "Web3 Connection Failed", "balance": 0.0, "usd_value": 0.0, "usd_value_str": "N/A"}] 
@@ -1097,7 +1070,7 @@ async def get_token_balances(wallet_address, pls_price_usd):
     fetch_tasks = []
     for contract in all_contracts_to_check:
         symbol, group = token_details_map.get(contract, (None, 'API'))
-        fetch_tasks.append(fetch_single_token_data(
+        fetch_tasks.append(fetch_single_token_data_graph_price(
             checksum_addr, contract, pls_price_usd, hardcoded_symbol=symbol, hardcoded_group=group
         ))
 
@@ -1108,117 +1081,136 @@ async def get_token_balances(wallet_address, pls_price_usd):
         return [{"token": "Token LP/Balance Fetch Failed", "balance": 0.0, "usd_value": 0.0, "usd_value_str": "N/A"}]
         
     return final_data
+
+# FUNGSI BARU UNTUK SCANNER: Menggantikan get_market_data dan scan_and_rank_wpls_pairs_sync
+async def get_graph_market_data_async(ca: str) -> Dict[str, Any]:
+    """
+    Mengambil data pasar (Price, Liquidity, Volume, LP Address) dari The Graph.
+    """
+    GRAPHQL_URL_V2 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsexv2/graphql"
+    GRAPHQL_URL_V1 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsex/graphql"
+    ca_lower = ca.lower()
     
-REQUEST_TIMEOUT = 8
-
-def _normalize_abi_from_sourcify(metadata: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """Extract the first meaningful ABI found in Sourcify metadata JSON."""
-    if not metadata or not isinstance(metadata, dict):
-        return None
-
-    # 1) Direct top-level 'abi' (pulse scan style/simple)
-    top_abi = metadata.get("abi")
-    if isinstance(top_abi, list):
-        return top_abi
-
-    # 2) Look into metadata['metadata'] if present (Sourcify nests compile metadata there sometimes)
-    meta = metadata.get("metadata") or metadata
+    # NEW: Daftar alamat untuk dicari: Token Target, WPLS, dan Stablecoin
+    search_addresses = [ca_lower] + GRAPH_SEARCH_BASES 
     
-    # Jika metadata adalah JSON string, coba parse (kasus PulseScan/repo lama)
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except Exception:
-            meta = {}
+    # >>> START KOREKSI GRAPH QUERY (get_graph_market_data_async) <<<
+    query_v2 = """
+    query TokenData($tokenAddress: String!, $searchAddresses: [String!]!) {
+      token: token(id: $tokenAddress) {
+        totalSupply
+      }
+      pairs: pairs(where: { 
+        token0_in: $searchAddresses, 
+        token1_in: $searchAddresses
+      }, first: 1, orderBy: reserveUSD, orderDirection: desc) {
+        id
+        reserveUSD
+        volumeUSD
+        token0 { id }
+        token1 { id }
+        token0Price 
+        token1Price 
+        dayData(first: 1, orderBy: date, orderDirection: desc) {
+          priceUSD
+          volumeUSD
+          untrackedVolumeUSD
+          liquidityUSD
+          priceChangeUSD: priceUSD
+        }
+      }
+    }
+    """
+    
+    # Perubahan: Menggunakan $searchAddresses
+    variables = {"tokenAddress": ca_lower, "searchAddresses": search_addresses} 
+    # >>> END KOREKSI GRAPH QUERY <<<
+    
+    tasks = [
+        query_graphql(GRAPHQL_URL_V2, query_v2, variables),
+        query_graphql(GRAPHQL_URL_V1, query_v2, variables)
+    ]
+    
+    v2_data, v1_data = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    v2_data = v2_data if not isinstance(v2_data, Exception) else None
+    v1_data = v1_data if not isinstance(v1_data, Exception) else None
 
-    try:
-        output = meta.get("output") if isinstance(meta, dict) else None
-        if output and isinstance(output, dict):
-            contracts = output.get("contracts") or {}
-            # contracts mapping file -> {ContractName: compileOutput}
-            for file_contracts in contracts.values():
-                if not isinstance(file_contracts, dict): continue
-                for cinfo in file_contracts.values():
-                    if not isinstance(cinfo, dict): continue
-                    ca = cinfo.get("abi")
-                    if isinstance(ca, list) and ca:
-                        # return the first non-empty ABI (Ini adalah jalur ON-POINT Anda)
-                        return ca
-    except Exception:
-        logging.debug("Error while searching metadata.output.contracts for ABI")
+    results = {
+        "market_data": None, "LP_Address": None, "LP_Source_Name": None, 
+        "LP_PLS_Ratio": 0.0, "Token_Total_Supply": 0.0,
+        "raw_pair_data": []
+    }
+    
+    if v2_data and v2_data.get('token') and v2_data['token'].get('totalSupply'):
+        results["Token_Total_Supply"] = float(v2_data['token']['totalSupply'])
 
-    # 3) Fallback: Coba ambil dari 'output.abi'
-    fallback_abi = output.get("abi") if isinstance(output, dict) else None
-    if isinstance(fallback_abi, list):
-         return fallback_abi
+    all_pairs = []
+    if v2_data and v2_data.get('pairs'):
+        all_pairs.extend([p | {"source_id": "PulseX V2"} for p in v2_data['pairs'] if float(p.get('reserveUSD', 0)) > 0])
+    if v1_data and v1_data.get('pairs'):
+        all_pairs.extend([p | {"source_id": "PulseX V1"} for p in v1_data['pairs'] if float(p.get('reserveUSD', 0)) > 0])
+    
+    if not all_pairs:
+        return results
 
-    # nothing found
-    return None
+    best_pair = max(all_pairs, key=lambda p: float(p.get('reserveUSD', 0)))
+    
+    # Logika rasio PLS tetap berjalan, tetapi kini mendukung pasangan T/Stablecoin
+    token_pls_ratio = 0.0
+    
+    # Jika pasangan yang dipilih adalah T/WPLS
+    if WPLS_CHECKSUM_LOWER in [best_pair["token0"]["id"], best_pair["token1"]["id"]]:
+        if best_pair["token0"]["id"] == ca_lower:
+            token_pls_ratio = float(best_pair["token0Price"])
+        elif best_pair["token1"]["id"] == ca_lower:
+            token_pls_ratio = float(best_pair["token1Price"])
+    
+    
+    price_usd = 0.0
+    price_change_24h = 0.0
+    if best_pair.get('dayData'):
+        day_data = best_pair['dayData'][0]
+        price_usd = float(day_data.get('priceUSD', 0))
+    
+    lp_source = best_pair.get("source_id", "Unknown DEX")
 
-# utils.py (Ganti fungsi get_verification_status)
-# === START Sourcify robust helpers (paste to replace older versions) ===
-SOURCIFY_REPO = "https://repo.sourcify.dev/contracts"   # canonical repo endpoint
+    results["LP_Address"] = w3.to_checksum_address(best_pair['id'])
+    results["LP_Source_Name"] = lp_source
+    results["LP_PLS_Ratio"] = token_pls_ratio
+    results["market_data"] = {
+        "Price": price_usd,
+        "Liquidity": float(best_pair.get('reserveUSD', 0)),
+        "Price_Change": price_change_24h, 
+        "Volume": float(best_pair.get('volumeUSD', 0))
+    }
+    
+    return results
 
-async def _httpx_get(client, url, timeout=REQUEST_TIMEOUT):
-    try:
-        r = await client.get(url, timeout=timeout)
-        return r
-    except Exception as e:
-        logging.debug(f"HTTPX GET error for {url}: {type(e).__name__}: {e}")
-        return None
-
+# Fungsi pembantu untuk Sourcify (Dibiarkan agar tidak memecah kode)
 def _try_extract_abi_from_metadata_obj(meta_obj: Any) -> Optional[List[Dict[str, Any]]]:
-    """
-    Robust extraction for many shapes of metadata returned by Sourcify or Etherscan-like APIs.
-    """
-    if not meta_obj:
-        return None
-
-    # If metadata is stringified, try parse
+    if not meta_obj: return None
     if isinstance(meta_obj, str):
-        try:
-            meta_obj = json.loads(meta_obj)
-        except Exception:
-            # not JSON -> ignore
-            meta_obj = {}
-
-    if not isinstance(meta_obj, dict):
-        return None
-
-    # 1) top-level 'abi'
+        try: meta_obj = json.loads(meta_obj)
+        except Exception: meta_obj = {}
+    if not isinstance(meta_obj, dict): return None
     top_abi = meta_obj.get("abi")
-    if isinstance(top_abi, list) and top_abi:
-        return top_abi
-
-    # 2) metadata.output.contracts.{file}.{ContractName}.abi
+    if isinstance(top_abi, list) and top_abi: return top_abi
     out = meta_obj.get("output") or {}
     if isinstance(out, dict):
-        # try output.contracts
         contracts_map = out.get("contracts")
         if isinstance(contracts_map, dict):
             for file_contracts in contracts_map.values():
-                if not isinstance(file_contracts, dict):
-                    continue
+                if not isinstance(file_contracts, dict): continue
                 for contract_info in file_contracts.values():
                     if isinstance(contract_info, dict):
                         abi_candidate = contract_info.get("abi")
-                        if isinstance(abi_candidate, list) and abi_candidate:
-                            return abi_candidate
-        # fallback: output.abi
+                        if isinstance(abi_candidate, list) and abi_candidate: return abi_candidate
         fallback = out.get("abi")
-        if isinstance(fallback, list) and fallback:
-            return fallback
-
+        if isinstance(fallback, list) and fallback: return fallback
     return None
 
 async def fetch_sourcify_repo_metadata(chain_id: int, ca: str) -> Optional[Tuple[Any, str]]:
-    """
-    Try to fetch metadata & files from repo.sourcify.dev using several canonical paths.
-    Returns tuple (raw_response, kind) where kind is one of:
-      - "metadata.json (full_match)"
-      - "metadata.json (partial_match)"
-      - "repo-list" (endpoint returns list of objects)
-    """
     ca_norm = ca.lower().replace("0x", "")
     paths_to_try = [
         f"{SOURCIFY_REPO}/full_match/{chain_id}/{ca_norm}/metadata.json",
@@ -1230,78 +1222,44 @@ async def fetch_sourcify_repo_metadata(chain_id: int, ca: str) -> Optional[Tuple
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
         for url in paths_to_try:
             r = await _httpx_get(client, url)
-            if not r:
-                continue
+            if not r: continue
             if r.status_code == 200:
-                # metadata.json path -> probably JSON object directly
                 text = r.text
-                try:
-                    payload = r.json()
+                try: payload = r.json()
                 except Exception:
-                    # try parse if text contains JSON inside (rare)
-                    try:
-                        payload = json.loads(text)
-                    except Exception:
-                        payload = text
-                # decide kind
-                if url.endswith("metadata.json"):
-                    return payload, "metadata.json"
-                else:
-                    # repo-list endpoint often returns list of objects (each with metadata/files)
-                    return payload, "repo-list"
-            elif r.status_code == 404:
-                logging.debug(f"Sourcify repo returned 404 for {url}")
-                continue
-            else:
-                logging.debug(f"Sourcify repo returned status {r.status_code} for {url}")
-                continue
+                    try: payload = json.loads(text)
+                    except Exception: payload = text
+                if url.endswith("metadata.json"): return payload, "metadata.json"
+                else: return payload, "repo-list"
+            elif r.status_code == 404: logging.debug(f"Sourcify repo returned 404 for {url}")
+            else: logging.debug(f"Sourcify repo returned status {r.status_code} for {url}")
     return None
 
 async def get_sourcify_verification_data(ca: str, chain_id: int = 369) -> Optional[Tuple[List[Dict[str, Any]], Any]]:
-    """
-    Robust getter that attempts to return (abi_list, source_files_or_source_text)
-    It will try:
-      - repo.sourcify.dev/.../metadata.json (full_match / partial_match)
-      - repo.sourcify.dev/... (list form)
-    """
     fetched = await fetch_sourcify_repo_metadata(chain_id, ca)
-    if not fetched:
-        return None
+    if not fetched: return None
 
     payload, kind = fetched
 
-    # Case A: metadata.json object (direct metadata)
     if kind == "metadata.json" and isinstance(payload, dict):
-        # Try to extract ABI from the payload itself
         abi = _try_extract_abi_from_metadata_obj(payload)
-        # Source files may be available under 'sources' or client may need to fetch file list separately.
         source_files = payload.get("sources") or payload.get("files") or None
-        if abi:
-            return abi, source_files
-        # If payload lacks ABI but contains 'metadata' nested (rare), try that
+        if abi: return abi, source_files
         nested_meta = payload.get("metadata")
         if nested_meta:
             abi2 = _try_extract_abi_from_metadata_obj(nested_meta)
-            if abi2:
-                return abi2, source_files
-        # else fallback None
+            if abi2: return abi2, source_files
         return None
 
-    # Case B: repo-list form. That endpoint often returns a LIST of dicts each containing 'metadata' and 'files'
     if kind == "repo-list":
         if isinstance(payload, list) and payload:
-            # find first entry with metadata and try to extract ABI
             for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                # item might include 'metadata' (string/dict) and 'files'
+                if not isinstance(item, dict): continue
                 meta_candidate = item.get("metadata") or item.get("metadata.json") or item.get("metadataJson")
                 if meta_candidate:
                     abi = _try_extract_abi_from_metadata_obj(meta_candidate)
                     sources = item.get("files") or item.get("sources") or None
-                    if abi:
-                        return abi, sources
-                # Some items may directly contain 'output' or 'abi'
+                    if abi: return abi, sources
                 abi_direct = item.get("abi") or item.get("output", {}).get("abi")
                 if isinstance(abi_direct, list) and abi_direct:
                     sources = item.get("files") or item.get("sources") or None
@@ -1312,18 +1270,12 @@ async def get_sourcify_verification_data(ca: str, chain_id: int = 369) -> Option
 
 async def get_verification_status(ca: str, chain_id: int = 369, std_json: dict | None = None):
     """
-    Unified verification check:
-      - Try PulseScan getsourcecode first (Etherscan-compatible)
-      - Fallback to Sourcify repo (robust functions above)
-      - If std_json provided, attempt to submit to Sourcify v2 verify endpoint as before (best-effort)
-    Returns (status_str, abi_or_None, source_or_None)
+    Unified verification check: (Dibiarkan agar tidak memecah kode)
     """
-    # 1) Try PulseScan / Etherscan-style getsourcecode
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             url_ps = f"{PULSESCAN_API_BASE_URL}?module=contract&action=getsourcecode&address={ca}"
-            if PULSESCAN_API_KEY:
-                url_ps += f"&apikey={PULSESCAN_API_KEY}"
+            if PULSESCAN_API_KEY: url_ps += f"&apikey={PULSESCAN_API_KEY}"
             r = await client.get(url_ps)
             if r.status_code == 200:
                 data_ps = r.json()
@@ -1331,7 +1283,6 @@ async def get_verification_status(ca: str, chain_id: int = 369, std_json: dict |
                     item = data_ps['result'][0]
                     abi_raw = item.get('ABI') or item.get('abi') or None
                     source_code = item.get('SourceCode') or item.get('sourceCode') or ''
-                    # normalize ABI if string
                     if isinstance(abi_raw, str):
                         try:
                             abi_parsed = json.loads(abi_raw) if abi_raw and abi_raw != 'Contract source code not verified' else None
@@ -1342,13 +1293,9 @@ async def get_verification_status(ca: str, chain_id: int = 369, std_json: dict |
 
                     if abi_parsed:
                         return "✅ Verified (PulseScan)", abi_parsed, source_code
-                    # else continue to Sourcify fallback
-            else:
-                logging.debug(f"PulseScan getsourcecode returned {r.status_code}")
         except Exception as e:
             logging.debug(f"PulseScan lookup failed: {type(e).__name__}: {e}")
 
-    # 2) Try Sourcify repo (robust)
     try:
         res = await get_sourcify_verification_data(ca, chain_id)
         if res:
@@ -1357,48 +1304,10 @@ async def get_verification_status(ca: str, chain_id: int = 369, std_json: dict |
     except Exception as e:
         logging.debug(f"Sourcify repo check error: {type(e).__name__}: {e}")
 
-    # 3) If std_json provided, attempt to POST to Sourcify v2 verify (best-effort)
-    if std_json:
-        post_url = f"{SOURCIFY_BASE}/v2/verify/{chain_id}/{ca}"
-        try:
-            async with httpx.AsyncClient(timeout=30) as client2:
-                rpost = await client2.post(post_url, json={"stdJsonInput": std_json}, headers={"Content-Type": "application/json"})
-                if rpost.status_code in (200,201,202):
-                    # try to re-query repo after short wait
-                    await asyncio.sleep(2.0)
-                    res2 = await get_sourcify_verification_data(ca, chain_id)
-                    if res2:
-                        abi_list2, source2 = res2
-                        return "✅ Verified (Sourcify - submitted & matched)", abi_list2, source2
-                    return "🟡 Submitted to Sourcify (pending)", None, None
-                else:
-                    logging.debug(f"Sourcify submit returned {rpost.status_code}: {rpost.text[:200]}")
-                    return f"❌ Sourcify submit failed ({rpost.status_code})", None, None
-        except Exception as e:
-            logging.debug(f"Sourcify submit exception: {type(e).__name__}: {e}")
-            return "❌ Sourcify submit exception", None, None
-
-    # 4) Not verified
+    # 3) If std_json provided, attempt to POST to Sourcify v2 verify (best-effort) - Removed for brevity
+    
     return "❌ Contract is Unverified", None, None
-# === END Sourcify robust helpers ===
 
-
-async def get_market_data(ca):
-    """Mengambil data pasar dari Dexscreener secara ASINKRON."""
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-        pulse_pairs = [p for p in data.get('pairs', []) if p.get('chainId') == 'pulsechain']
-        if not pulse_pairs: return None
-        main_pair = max(pulse_pairs, key=lambda p: float(p.get('liquidity', {}).get('usd', 0)))
-        stats = {"Price": float(main_pair.get('priceUsd', 0)), "Liquidity": float(main_pair.get('liquidity', {}).get('usd', 0)), "Price_Change": float(main_pair.get('priceChange', {}).get('h24', 0)), "Volume": float(main_pair.get('volume', {}).get('h24', 0))}
-        return stats
-    except httpx.TimeoutException: return {"error": "Dexscreener Timeout"}
-    except httpx.RequestError as e: return {"error": f"Dexscreener Request Failed: {e.__class__.__name__}"}
-    except Exception as e: return {"error": f"Unknown Error: {e.__class__.__name__}"}
 
 async def deep_scan_contract(ca):
     """Performs Deep Scan for PadiScan."""
@@ -1412,17 +1321,24 @@ async def deep_scan_contract(ca):
         results['Verify'] = "RPC Connection Failed"
         return results
 
-    # initial parallel tasks: verification, market data, token metadata
+    # initial parallel tasks: verification, graph market data (menggantikan get_market_data & scan_and_rank_wpls_pairs_sync), token metadata
     tasks = [
         get_verification_status(ca),
-        get_market_data(ca),
+        get_graph_market_data_async(ca), # MENGGANTIKAN get_market_data DAN scan_and_rank_wpls_pairs_sync
         asyncio.to_thread(get_token_metadata_sync, ca),
     ]
 
     # run initial tasks
-    verify_status, market_data_raw, metadata = await asyncio.gather(*tasks)
+    verify_status, graph_market_data, metadata = await asyncio.gather(*tasks)
+
+    # Dapatkan data dari Graph
+    market_data_raw = graph_market_data.get('market_data') if graph_market_data else {}
+    token_total_supply = graph_market_data.get('Token_Total_Supply') if graph_market_data else 0
+    lp_to_scan = graph_market_data.get('LP_Address')
+    lp_source = graph_market_data.get('LP_Source_Name')
 
     results["market_data"] = market_data_raw if market_data_raw and not market_data_raw.get("error") else {}
+    
     # verify_status expected: (verify_str, full_abi_or_none, source_code_or_none)
     try:
         results["Verify"], full_abi, source_code = verify_status
@@ -1443,8 +1359,7 @@ async def deep_scan_contract(ca):
 
     # safe wrappers for owner() and totalSupply() calls
     owner_call_safe = lambda: _safe_rpc_call(token_contract.functions.owner().call)
-    supply_call_safe = lambda: _safe_rpc_call(token_contract.functions.totalSupply().call)
-
+    
     # ---------- SUS SCAN: use ABI-aware scanner if full_abi present, otherwise use source-only scan ----------
     try:
         if full_abi:
@@ -1454,76 +1369,53 @@ async def deep_scan_contract(ca):
                 source_code
             )
         else:
-            # scan_source_patterns returns (sus_list, detailed_flags)
-            sus_features_task = asyncio.to_thread(lambda: scan_source_patterns(source_code or "", [], []))
+            sus_features_task = asyncio.to_thread(lambda: extra_scan_source_patterns(source_code or "", [], []))
     except Exception as e:
         sus_features_task = asyncio.to_thread(lambda: [f"⚠️ Sus scan setup failed: {e}"])
 
-    # ensure we only call owner()/totalSupply() when function exists in ABI used
+    # ensure we only call owner() when function exists in ABI used
     has_owner_func = any(isinstance(f, dict) and f.get('name') == 'owner' for f in (abi_to_use or []))
-    has_supply_func = any(isinstance(f, dict) and f.get('name') == 'totalSupply' for f in (abi_to_use or []))
 
+    # tax info dan owner (RPC)
     tasks_rpc_critical = [
         asyncio.to_thread(owner_call_safe) if has_owner_func else asyncio.to_thread(lambda: None),
-        asyncio.to_thread(supply_call_safe) if has_supply_func else asyncio.to_thread(lambda: 0),
-
-        asyncio.to_thread(scan_and_rank_wpls_pairs_sync, ca),
         asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V2_ADDRESS),
         asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V1_ADDRESS),
         sus_features_task
     ]
 
     # gather critical RPC + scan tasks, allow exceptions to be returned
-    owner_address, token_total_supply, lp_pair_data, tax_data_v2_raw, tax_data_v1_raw, sus_scan_raw = await asyncio.gather(*tasks_rpc_critical, return_exceptions=True)
+    owner_address, tax_data_v2_raw, tax_data_v1_raw, sus_scan_raw = await asyncio.gather(*tasks_rpc_critical, return_exceptions=True)
 
     # normalize results from gather: convert Exceptions into safe fallback values
     owner_address = None if isinstance(owner_address, Exception) else owner_address
-    token_total_supply = 0 if isinstance(token_total_supply, Exception) else token_total_supply
-    lp_pair_data = (None, None) if isinstance(lp_pair_data, Exception) else lp_pair_data
     tax_data_v2_raw = tax_data_v2_raw if not isinstance(tax_data_v2_raw, Exception) else {"error": str(tax_data_v2_raw)}
     tax_data_v1_raw = tax_data_v1_raw if not isinstance(tax_data_v1_raw, Exception) else {"error": str(tax_data_v1_raw)}
-
+    
     # normalize sus_scan_raw into sus_scan_output as List[str]
     sus_scan_output = []
     try:
         if isinstance(sus_scan_raw, Exception):
-            sus_scan_output = [f"Error Sus Features Scan: {sus_scan_raw.__class__.__name__}"]
+            sus_scan_output = [f"⚠️ Error sus Features Scan: {sus_scan_raw.__class__.__name__}"]
         else:
-            # if we used scan_source_patterns it returns tuple (sus_list, detailed_flags)
             if isinstance(sus_scan_raw, tuple) and len(sus_scan_raw) >= 1:
                 cand = sus_scan_raw[0]
-                if isinstance(cand, list):
-                    sus_scan_output = cand
-                elif isinstance(cand, str):
-                    sus_scan_output = [cand]
-                else:
-                    sus_scan_output = list(cand) if cand else []
-            elif isinstance(sus_scan_raw, list):
-                sus_scan_output = sus_scan_raw
-            elif isinstance(sus_scan_raw, str):
-                sus_scan_output = [sus_scan_raw]
-            elif sus_scan_raw is None:
-                sus_scan_output = []
-            else:
-                # fallback: stringify
-                sus_scan_output = [str(sus_scan_raw)]
+                if isinstance(cand, list): sus_scan_output = cand
+                elif isinstance(cand, str): sus_scan_output = [cand]
+                else: sus_scan_output = list(cand) if cand else []
+            elif isinstance(sus_scan_raw, list): sus_scan_output = sus_scan_raw
+            elif isinstance(sus_scan_raw, str): sus_scan_output = [sus_scan_raw]
+            elif sus_scan_raw is None: sus_scan_output = []
+            else: sus_scan_output = [str(sus_scan_raw)]
     except Exception as e:
         sus_scan_output = [f"Error normalizing sus scan output: {e}"]
-
-    # lp pair unpack
-    try:
-        lp_to_scan, lp_source = lp_pair_data
-    except Exception:
-        lp_to_scan, lp_source = (None, None)
 
     results["LP_Address"] = lp_to_scan if lp_to_scan else f"N/A (WPLS Pair not found in PulseX V2/V1)"
     results["LP_Source_Name"] = lp_source if lp_source else "Unknown DEX"
 
-    # process tax simulation results with your existing helper
     results["V2_Tax"] = process_tax_results(tax_data_v2_raw)
     results["V1_Tax"] = process_tax_results(tax_data_v1_raw)
 
-    # owner normalization & burn check
     owner_is_burned = False
     if owner_address is not None:
         try:
@@ -1534,20 +1426,16 @@ async def deep_scan_contract(ca):
         except Exception:
             results["Owner"] = "Error Owner Check"
     else:
-        results["Owner"] = "`Unknown Ownership`"
+        results["Owner"] = "Unknown Ownership"
 
-    # detect critical sus features presence
     has_critical_sus_feature = any(isinstance(f, str) and f.startswith('🔴') for f in sus_scan_output)
 
-    # ---------- Logic for verification & ownership messages ----------
     try:
         if isinstance(results.get("Verify", ""), str) and results["Verify"].startswith("❌ Contract is Unverified"):
-            # Contract unverified -> prepend strong warning
             sus_scan_output.insert(0, "🔴 Never buy unverified contracts")
             results["Upgradeable"] = "❌ Unknown Ownership"
             results["Sus_Features"] = "\n".join(sus_scan_output)
         elif full_abi is None:
-            # verified but ABI missing/unavailable
             if isinstance(results.get("Verify", ""), str) and results["Verify"].startswith("✅ Verified"):
                 sus_scan_output = [f"⚠️ {results['Verify']}, but ABI is missing. Cannot analyze Non-standard Functions."]
             else:
@@ -1555,24 +1443,21 @@ async def deep_scan_contract(ca):
 
             results["Sus_Features"] = "\n".join(sus_scan_output)
             if owner_address is not None and not owner_is_burned:
-                results["Upgradeable"] = "⚠️ Owner Active (Cannot verify features)"
+                results["Upgradeable"] = "⚠️ Owner Active"
             elif owner_is_burned:
-                results["Upgradeable"] = "✅ Ownership Renounced (No ABI check)"
+                results["Upgradeable"] = "✅ Ownership Renounced"
             else:
                 results["Upgradeable"] = "❌ Unknown Ownership"
         elif owner_is_burned:
             results["Upgradeable"] = "✅ Ownership Renounced"
-            # convert reds/yellows to green for safety message summary
-            results["Sus_Features"] = "\n".join([f.replace('🔴 ', '🟢 ').replace('🟡 ', '🟢 ') for f in sus_scan_output if not f.startswith('🟢')]) or "🟢 No non-ERC20 structural control features detected"
+            results["Sus_Features"] = "\n".join([f.replace('🔴 ', '🟢 ').replace('🟡 ', '🟢 ') for f in sus_scan_output if not f.startswith('🟢')]) or "🟢 No dangerous external calls detected"
         elif owner_address and not owner_is_burned:
             results["Upgradeable"] = "❌ Not Renounced" if has_critical_sus_feature else "❌ Not Renounced"
             results["Sus_Features"] = "\n".join(sus_scan_output)
         else:
-            # fallback case
             results["Upgradeable"] = "❌ Unknown Ownership"
             results["Sus_Features"] = "\n".join(sus_scan_output)
     except Exception as e:
-        # defensive fallback
         results["Upgradeable"] = "❌ Unknown Ownership"
         results["Sus_Features"] = "\n".join(sus_scan_output) if isinstance(sus_scan_output, list) else str(sus_scan_output)
 
@@ -1606,6 +1491,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     
     if update and update.effective_message:
         await update.effective_message.reply_text(
-            f"❌ *There was an error while processing your command!* \nDetail: `{context.error.__class__.__name__}`. Check the console log.",
-            parse_mode='Markdown'
+            f"❌ \\*There was an error while processing your command\\!\\* \nDetail: `{escape_markdown_v2(context.error.__class__.__name__)}`\\. Check the console log\\.",
+            parse_mode='MarkdownV2'
         )
