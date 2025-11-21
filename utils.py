@@ -8,9 +8,13 @@ import re
 import asyncio
 from web3 import Web3
 from web3.exceptions import ContractLogicError, BadFunctionCallOutput
-from typing import Tuple, Any, Dict, Optional, List
+from typing import Tuple, Any, Dict, Optional, List, Set
 from dotenv import load_dotenv
 from telegram.ext import ContextTypes 
+
+# Tambahkan ke bagian UTILS
+PULSEX_V1_GRAPHQL_URL = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsex/graphql"
+PULSEX_V2_GRAPHQL_URL = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsexv2/graphql"
 
 # --- 1. Konfigurasi Global & Konstanta ---
 load_dotenv()
@@ -241,3 +245,127 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     print(f"\n\n🚨 TELEGRAM HANDLER CRASHED! 🚨\nError: {context.error}\n" + "-" * 50)
     if update and update.effective_message:
         await update.effective_message.reply_text(f"❌ \\*Error processing command\\!\\* \nDetail: `{escape_markdown_v2(context.error.__class__.__name__)}`", parse_mode='MarkdownV2')
+        
+# ==========================
+#  HARGA TOKEN VIA SUBGRAPH
+# ==========================
+
+async def fetch_prices_from_subgraph(url: str, address_list: List[str]) -> Dict[str, float]:
+    """
+    Ambil harga token (derivedUSD) dari subgraph PulseX.
+    - Hanya baca entitas 'tokens'.
+    - Return: {address_lower: price_usd}
+    """
+    prices: Dict[str, float] = {}
+
+    # Tidak ada alamat = tidak usah query
+    if not address_list:
+        return prices
+
+    # Normalisasi ke lowercase
+    addr_lower = [a.lower() for a in address_list]
+
+    query = """
+    query GetTokenPrices($tokenAddresses: [ID!]!) {
+      tokens(where: {id_in: $tokenAddresses}, first: 1000) {
+        id
+        derivedUSD
+      }
+    }
+    """
+    variables = {"tokenAddresses": addr_lower}
+
+    data = await query_graphql(url, query, variables)
+    if not data:
+        return prices
+
+    tokens = data.get("tokens", [])
+    for token in tokens:
+        addr = (token.get("id") or "").lower()
+        raw = token.get("derivedUSD", 0)
+        try:
+            price = float(raw or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+
+        if addr and price > 0:
+            prices[addr] = price
+
+    return prices
+
+
+async def fetch_wpls_price_fallback() -> float:
+    """
+    Fallback khusus WPLS/PLS:
+    - Coba ambil harga PLS dari CoinGecko.
+    - Kalau gagal, return 0.0 (jadi nilai PLS = 0 di report, tapi bot tidak crash).
+    """
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=pulsechain&vs_currencies=usd"
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            price = float(data.get("pulsechain", {}).get("usd", 0) or 0)
+            if price <= 0:
+                logging.error("Fallback WPLS price from CoinGecko is 0.")
+            return price
+    except Exception as e:
+        logging.error(f"Failed to fetch WPLS price from fallback API: {e}")
+        return 0.0
+
+
+async def get_prices_graphql_batch(addresses: Set[str]) -> Dict[str, float]:
+    """
+    Ambil harga token batch dari:
+      1) PulseX V2 subgraph
+      2) PulseX V1 subgraph (fallback)
+      3) Fallback WPLS dari API eksternal (CoinGecko)
+    """
+    final_prices: Dict[str, float] = {}
+
+    if not addresses:
+        return final_prices
+
+    # Normalisasi semua alamat ke lowercase
+    all_addrs: Set[str] = {a.lower() for a in addresses if a}
+    # Pastikan WPLS selalu ikut di-query
+    all_addrs.add(WPLS_CHECKSUM_LOWER)
+
+    addr_list = list(all_addrs)
+
+    # --- Langkah 1: coba PulseX V2 dulu ---
+    logging.info("Fetching token prices from PulseX V2 subgraph...")
+    try:
+        prices_v2 = await fetch_prices_from_subgraph(PULSEX_V2_GRAPHQL_URL, addr_list)
+        final_prices.update(prices_v2)
+    except Exception as e:
+        logging.warning(f"Error fetching prices from V2: {e}")
+
+    # Cek alamat yang masih belum ada harga / 0
+    missing = [a for a in all_addrs if final_prices.get(a, 0.0) <= 0]
+
+    # --- Langkah 2: fallback ke PulseX V1 ---
+    if missing:
+        logging.info(f"Missing {len(missing)} prices from V2. Trying PulseX V1...")
+        try:
+            prices_v1 = await fetch_prices_from_subgraph(PULSEX_V1_GRAPHQL_URL, missing)
+            for addr, price in prices_v1.items():
+                if price > 0:
+                    final_prices[addr] = price
+        except Exception as e:
+            logging.warning(f"Error fetching prices from V1: {e}")
+
+    # --- Langkah 3: Fallback khusus WPLS ---
+    wpls_price = final_prices.get(WPLS_CHECKSUM_LOWER, 0.0)
+    if wpls_price <= 0:
+        logging.info("WPLS price not found in subgraphs. Using fallback API...")
+        wpls_price = await fetch_wpls_price_fallback()
+        if wpls_price > 0:
+            final_prices[WPLS_CHECKSUM_LOWER] = wpls_price
+        else:
+            # Kalau tetap gagal, set 0 tapi log error
+            final_prices[WPLS_CHECKSUM_LOWER] = 0.0
+            logging.error("Failed to resolve WPLS price from both subgraphs and fallback API.")
+
+    return final_prices
