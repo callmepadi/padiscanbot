@@ -5,34 +5,31 @@ import logging
 from web3 import Web3
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, ApplicationBuilder
-import asyncio
+from telegram.ext import CommandHandler, ApplicationBuilder
 
-# --- PENGUBAHAN KRITIS START ---
-
-# Panggil load_dotenv di sini agar variabel tersedia
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PULSECHAIN_RPC_URL = os.getenv("PULSECHAIN_RPC_URL")
-HONEY_V2_ADDRESS = os.getenv("HONEY_V2_ADDRESS") 
-HONEY_V1_ADDRESS = os.getenv("HONEY_V1_ADDRESS")
-
-# Import utilitas dan handler dari file lokal. 
+# --- IMPORTS DARI MODUL SENDIRI ---
 # HANYA impor w3 dan error_handler dari utils.py
 from utils import w3, error_handler 
 from handlers_scan import padiscan
 from handlers_track import paditrack
 
-# --- PENGUBAHAN KRITIS END ---
-
 # Konfigurasi Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 def main():
     """Fungsi utama untuk menjalankan bot."""
     
-    # Cek Ketersediaan Variabel Lingkungan
+    # 1. Load Environment Variables
+    load_dotenv()
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    PULSECHAIN_RPC_URL = os.getenv("PULSECHAIN_RPC_URL")
+    HONEY_V2_ADDRESS = os.getenv("HONEY_V2_ADDRESS") 
+    HONEY_V1_ADDRESS = os.getenv("HONEY_V1_ADDRESS")
+
+    # 2. Validasi Environment Variables
     if not TELEGRAM_TOKEN:
         print("❌ Error: TELEGRAM_TOKEN must be set in the .env file.")
         return
@@ -42,9 +39,10 @@ def main():
         return
     
     if not HONEY_V2_ADDRESS or not HONEY_V1_ADDRESS:
-        print("❌ Warning: HONEY_V2_ADDRESS and HONEY_V1_ADDRESS must be set in .env for PadiScan Tax checks.")
+        print("⚠️ Warning: HONEY_V2_ADDRESS and HONEY_V1_ADDRESS should be set in .env for accurate Tax checks.")
 
-    # Catatan: w3 diinisialisasi di utils.py menggunakan PULSECHAIN_RPC_URL
+    # 3. Validasi Koneksi Web3
+    # Catatan: w3 diinisialisasi di utils.py, kita cek statusnya di sini
     if w3 is None:
         print("❌ Error: Web3 Initialization Failed. Check PULSECHAIN_RPC_URL.")
         return
@@ -57,7 +55,7 @@ def main():
     print("✅ Connected to PulseChain RPC. PadiBot (Scanner & Tracker) is running...")
 
     try:
-        # Inisialisasi Application Builder
+        # 4. Inisialisasi Bot
         application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
         # --- COMMAND HANDLERS ---
@@ -67,7 +65,8 @@ def main():
         # Tambahkan error handler
         application.add_error_handler(error_handler)
 
-        # Jalankan bot
+        # 5. Jalankan Bot
+        # drop_pending_updates=True agar bot tidak memproses pesan lama saat restart
         application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
         
     except Exception as e:
