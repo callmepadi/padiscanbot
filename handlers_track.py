@@ -12,72 +12,23 @@ from utils import (
     w3,
     PULSESCAN_API_BASE_URL,
     PULSESCAN_API_KEY,
-    DEXSCREENER_API_URL,
     WPLS_ADDRESS,
     PT_TOKENS_LIST,
     human_format,
     classify_wallet,
-    escape_markdown_v2
+    escape_markdown_v2,
+    get_prices_graphql_batch,   # ✅ harga dari subgraph (V2 → V1)
 )
 
-async def get_prices_dexscreener_batch(addresses: List[str]) -> Dict[str, float]:
-    """
-    Mengambil harga token (priceUsd) dari DexScreener secara batch.
-    Mengembalikan dictionary {address_lowercase: price_float}.
-    """
-    prices = {}
-    if not addresses:
-        return prices
-
-    # DexScreener mendukung hingga 30 alamat per request
-    chunk_size = 30
-    chunks = [addresses[i:i + chunk_size] for i in range(0, len(addresses), chunk_size)]
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        for chunk in chunks:
-            url = f"{DEXSCREENER_API_URL}/{','.join(chunk)}"
-            try:
-                response = await client.get(url)
-                data = response.json()
-                
-                # DexScreener mengembalikan 'pairs'. Kita ambil pair dengan likuiditas tertinggi
-                # atau update harga jika token ditemukan.
-                if data and 'pairs' in data:
-                    for pair in data['pairs']:
-                        # DexScreener bisa mengembalikan banyak pair untuk token yang sama.
-                        # Kita prioritaskan pair di PulseChain (chain id: pulsechain)
-                        if pair.get('chainId') != 'pulsechain':
-                            continue
-
-                        base_token = pair.get('baseToken', {})
-                        quote_token = pair.get('quoteToken', {})
-                        price_usd = float(pair.get('priceUsd', 0) or 0)
-
-                        if price_usd <= 0:
-                            continue
-
-                        # Simpan harga untuk baseToken
-                        base_addr = base_token.get('address', '').lower()
-                        if base_addr and base_addr not in prices:
-                             prices[base_addr] = price_usd
-                        
-                        # Simpan harga untuk quoteToken (opsional, tapi membantu kelengkapan)
-                        quote_addr = quote_token.get('address', '').lower()
-                        if quote_addr and quote_addr not in prices:
-                            prices[quote_addr] = price_usd
-
-            except Exception as e:
-                logging.error(f"DexScreener batch fetch error: {e}")
-    
-    return prices
+# --- FUNGSI DATA WALLET ---
 
 async def get_wallet_data_optimized(wallet_address: str):
     """
-    Fungsi utama yang dioptimalkan:
+    Fungsi utama:
     1. Ambil saldo PLS.
-    2. Ambil daftar Token API.
-    3. Ambil Harga Batch dari DexScreener.
-    4. Hitung Nilai.
+    2. Ambil daftar Token via PulseScan.
+    3. Ambil Harga Batch via Subgraph (PulseX V2 + V1).
+    4. Hitung nilai PLS & token.
     """
     checksum_addr = w3.to_checksum_address(wallet_address)
     
@@ -91,20 +42,24 @@ async def get_wallet_data_optimized(wallet_address: str):
     # 2. Ambil Daftar Token dari PulseScan
     token_list = []
     url_tokenlist = f"{PULSESCAN_API_BASE_URL}?module=account&action=tokenlist&address={checksum_addr}"
-    if PULSESCAN_API_KEY: url_tokenlist += f"&apikey={PULSESCAN_API_KEY}"
+    if PULSESCAN_API_KEY:
+        url_tokenlist += f"&apikey={PULSESCAN_API_KEY}"
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(url_tokenlist)
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                logging.warning("PulseScan returned invalid JSON")
+                data = {}
             if data.get('status') == '1' and isinstance(data.get('result'), list):
                 token_list = data['result']
     except Exception:
         logging.warning("PulseScan API Tokenlist fetch failed.")
 
-    # 3. Siapkan daftar alamat untuk DexScreener
-    # Kita butuh WPLS untuk menghitung nilai PLS native
-    addresses_to_fetch = {WPLS_ADDRESS.lower()} 
+    # 3. Siapkan daftar alamat untuk GraphQL
+    addresses_to_fetch: Set[str] = {WPLS_ADDRESS.lower()}  # WPLS harus selalu ada
     
     parsed_tokens = []
 
@@ -116,11 +71,8 @@ async def get_wallet_data_optimized(wallet_address: str):
             if contract_addr:
                 addresses_to_fetch.add(contract_addr.lower())
                 
-                # Parse decimals
-                decimals = t.get('TokenDecimal')
-                if not decimals: decimals = 18
-                else: decimals = int(decimals)
-                
+                # Parse decimals dengan aman
+                decimals = int(t.get('TokenDecimal') or 18)
                 real_bal = raw_bal / (10 ** decimals)
                 
                 parsed_tokens.append({
@@ -131,8 +83,8 @@ async def get_wallet_data_optimized(wallet_address: str):
                     "type": "ERC20"
                 })
 
-    # 4. Ambil Harga (Batch)
-    price_map = await get_prices_dexscreener_batch(list(addresses_to_fetch))
+    # 4. Ambil Harga (Batch) dari Multi-Subgraph
+    price_map = await get_prices_graphql_batch(addresses_to_fetch)
 
     # 5. Hitung Nilai PLS Native
     pls_price = price_map.get(WPLS_ADDRESS.lower(), 0.0)
@@ -149,25 +101,26 @@ async def get_wallet_data_optimized(wallet_address: str):
         addr = token['address']
         price = price_map.get(addr, 0.0)
         
-        value_usd = 0.0
-        value_str = "N/A"
-
+        # Hitung nilai token
+        value_usd = token['balance'] * price if price > 0 else 0.0
+        
         if price > 0:
-            value_usd = token['balance'] * price
             total_token_usd += value_usd
-            if value_usd < 0.01 and value_usd > 0:
+            if 0 < value_usd < 0.01:
                 value_str = f"≈ ${value_usd:.4f}"
             else:
                 value_str = f"≈ ${human_format(value_usd)}"
-        
+        else:
+            value_str = "N/A"  # Harga tidak ditemukan di subgraph
+
         # Tentukan Grup
         group = pt_map.get(addr, "BASIC")
 
         final_token_data.append({
             "symbol": token['symbol'],
             "balance": token['balance'],
-            "value_usd": value_usd, # Float untuk sorting
-            "value_str": value_str, # String untuk display
+            "value_usd": value_usd,  # Float untuk sorting
+            "value_str": value_str,  # String untuk display
             "group": group
         })
 
@@ -180,6 +133,8 @@ async def get_wallet_data_optimized(wallet_address: str):
         "total_token_value": total_token_usd,
         "tokens": final_token_data
     }
+
+# --- HANDLER TELEGRAM ---
 
 async def paditrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the /paditrack command (OPTIMIZED)."""
@@ -198,9 +153,9 @@ async def paditrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         checksum_addr = w3.to_checksum_address(wallet_address)
         code = await asyncio.to_thread(lambda: w3.eth.get_code(checksum_addr))
-        if code and code != b'0x' and code != b'\x00':
-             await update.message.reply_text("❌ That’s a contract, not a wallet\\.", parse_mode='MarkdownV2')
-             return
+        if code and len(code) > 0:
+            await update.message.reply_text("❌ That’s a contract, not a wallet\\.", parse_mode='MarkdownV2')
+            return
     except InvalidAddress:
         await update.message.reply_text("❌ Invalid wallet address\\.", parse_mode='MarkdownV2')
         return
@@ -226,7 +181,7 @@ async def paditrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance_fmt = escape_markdown_v2(human_format(t['balance']))
         value_fmt = escape_markdown_v2(t['value_str'])
         
-        # Format baris: SYMBOL (kiri), BALANCE (kanan), VALUE (kanan)
+        # Format baris
         line = f"{clean_symbol:<10} {balance_fmt:>12} {value_fmt:>15}"
         
         if t['group'] == 'PT':
@@ -258,7 +213,7 @@ async def paditrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tokens_val_esc = escape_markdown_v2(human_format(data['total_token_value']))
     
     social = escape_markdown_v2("@padicalls")
-    sep = "\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\-\-\\"
+    sep = "\\-" * 20   # ✅ separator di-escape agar lolos MarkdownV2
 
     report = f"""
 *Total Value:* ${total_val_esc}
@@ -291,3 +246,4 @@ async def paditrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending message: {e}")
         await update.message.reply_text("⚠️ Failed to send report\\.", parse_mode='MarkdownV2')
+       
