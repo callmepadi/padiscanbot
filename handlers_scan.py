@@ -1,5 +1,3 @@
-# handlers_scan.py
-
 import re
 import json
 import asyncio
@@ -34,6 +32,9 @@ from utils import (
     _httpx_get,
     get_token_metadata_sync
 )
+
+# Konstanta Chain ID untuk Dexscreener (PulseChain)
+PULSECHAIN_CHAIN_ID = "pulsechain" 
 
 # --- FUNGSI PADI SCAN (Logic Internal) ---
 
@@ -229,13 +230,28 @@ def get_tax_info_simulation_sync(token_address, honey_ca):
         results = _safe_rpc_call(lambda: honey_contract.functions.checkHoneyMain(w3.to_checksum_address(token_address)).call({'gas': 5000000})) 
         if results is None or len(results) < 7: return {"error": "Tax simulation failed to return expected data."}
         buyEstimate, buyReal, sellEstimate, sellReal, buy, sell, _ = results
+        
         tax_results["BuySuccess"] = buy; tax_results["SellSuccess"] = sell
-        if buyEstimate > 0 and buyReal > 0: tax_results["BuyTax"] = round((buyEstimate - buyReal) / buyEstimate * 100, 2)
-        elif buyEstimate > 0 and buyReal == 0 and buy: tax_results["BuyTax"] = 100.0
-        elif not buy: tax_results["BuyTax"] = "Fail"
-        if sellEstimate > 0 and sellReal > 0: tax_results["SellTax"] = round((sellEstimate - sellReal) / sellEstimate * 100, 2)
-        elif sellEstimate > 0 and sellReal == 0 and sell: tax_results["SellTax"] = 100.0
-        elif not sell: tax_results["SellTax"] = "Fail"
+        
+        # KOREKSI LOGIKA 0%: Pastikan Tax adalah 0.0 jika buy/sell berhasil dan real == estimate
+        if buyEstimate > 0 and buyReal > 0: 
+            tax_results["BuyTax"] = round((buyEstimate - buyReal) / buyEstimate * 100, 2)
+        elif buyEstimate > 0 and buyReal == buyEstimate and buy: # Jika berhasil dan hasilnya 0
+            tax_results["BuyTax"] = 0.0 
+        elif buyEstimate > 0 and buyReal == 0 and buy: 
+            tax_results["BuyTax"] = 100.0
+        elif not buy: 
+            tax_results["BuyTax"] = "Fail"
+
+        if sellEstimate > 0 and sellReal > 0: 
+            tax_results["SellTax"] = round((sellEstimate - sellReal) / sellEstimate * 100, 2)
+        elif sellEstimate > 0 and sellReal == sellEstimate and sell: # Jika berhasil dan hasilnya 0
+            tax_results["SellTax"] = 0.0
+        elif sellEstimate > 0 and sellReal == 0 and sell: 
+            tax_results["SellTax"] = 100.0
+        elif not sell: 
+            tax_results["SellTax"] = "Fail"
+
     except Exception as e:
         return {"error": f"Tax simulation failed: {e.__class__.__name__} - {str(e)}"}
     return tax_results
@@ -247,81 +263,170 @@ def process_tax_results(tax_data_raw):
         buy_tax = tax_data_raw.get('BuyTax'); sell_tax = tax_data_raw.get('SellTax'); buy_ok = tax_data_raw.get('BuySuccess', False); sell_ok = tax_data_raw.get('SellSuccess', False)
         if isinstance(buy_tax, (int, float)):
             if not isinstance(sell_tax, (int, float)) or sell_tax > 20.0 or sell_tax < 0: sell_tax = buy_tax 
-        buy_tax_str = f"{buy_tax:.2f}%" if isinstance(buy_tax, (int, float)) else "N/A"
-        sell_tax_str = f"{sell_tax:.2f}%" if isinstance(sell_tax, (int, float)) else "N/A"
-        tax_data["BuyTax"] = buy_tax_str; tax_data["SellTax"] = sell_tax_str; tax_data["BuySuccess"] = buy_ok; tax_data["SellSuccess"] = sell_ok
+        
+        # Pastikan format 0.00% jika nilainya adalah 0.0
+        buy_tax_str = f"{buy_tax:.2f}%" if isinstance(buy_tax, (int, float)) and buy_tax >= 0 else "N/A"
+        sell_tax_str = f"{sell_tax:.2f}%" if isinstance(sell_tax, (int, float)) and sell_tax >= 0 else "N/A"
+        
+        tax_data["BuyTax"] = buy_tax_str
+        tax_data["SellTax"] = sell_tax_str
+        tax_data["BuySuccess"] = buy_ok
+        tax_data["SellSuccess"] = sell_ok
+        
         if buy_ok and not sell_ok: tax_data["Honeypot"] = "🚨 Honeypot"
         elif isinstance(sell_tax, (int, float)) and sell_tax >= 99.0: tax_data["Honeypot"] = "🚨 100% Tax"
         elif not buy_ok and not sell_ok: tax_data["Honeypot"] = "❌ Unknown"
         else: tax_data["Honeypot"] = "✅ OK"
+        
     tax_data["BuyTax"] = escape_markdown_v2(tax_data["BuyTax"]); tax_data["SellTax"] = escape_markdown_v2(tax_data["SellTax"]); tax_data["Honeypot"] = escape_markdown_v2(tax_data["Honeypot"])
     return tax_data
 
 def deep_lp_scan_sync(lp_to_scan, token_contract, token_total_supply, w3, BURN_ADDRESSES_CHECKSUM, lp_source):
     data = {"LP_Source_Name": lp_source}
+
     try:
-        lp_address_checksum = lp_to_scan 
-        lp_contract = w3.eth.contract(address=lp_address_checksum, abi=TOKEN_MINIMAL_ABI)
-        lp_total_supply = _safe_rpc_call(lp_contract.functions.totalSupply().call)
-        if lp_total_supply is None or lp_total_supply == 0:
-            data["LP_burnt"] = "N/A (LP Total Supply is 0)"; data["Supply_in_Pool"] = "N/A"
+        lp = lp_to_scan
+        lp_contract = w3.eth.contract(address=lp, abi=TOKEN_MINIMAL_ABI)
+
+        # Total LP Supply
+        lp_total_supply = _safe_rpc_call(lambda: lp_contract.functions.totalSupply().call())
+        if not lp_total_supply:
+            data["LP_burnt"] = "N/A (LP Total Supply 0)"
+            data["Supply_in_Pool"] = "N/A"
             return data
-        lp_total_burnt_balance = sum(_safe_rpc_call(lambda: lp_contract.functions.balanceOf(a).call()) or 0 for a in BURN_ADDRESSES_CHECKSUM)
-        percent_burnt = (lp_total_burnt_balance / lp_total_supply) * 100
-        data["LP_burnt"] = f"{percent_burnt:.2f}% 🔥 | {lp_source}"
-        token_total_burnt_balance = sum(_safe_rpc_call(lambda: token_contract.functions.balanceOf(a).call()) or 0 for a in BURN_ADDRESSES_CHECKSUM)
-        if token_total_supply == 0: raise Exception("Total supply is zero")
-        percent_supply_burnt = (token_total_burnt_balance / token_total_supply) * 100
-        token_balance_in_pool = _safe_rpc_call(lambda: token_contract.functions.balanceOf(lp_address_checksum).call()) or 0
-        percent_in_pool = (token_balance_in_pool / token_total_supply) * 100
-        data["Supply_in_Pool"] = f"{percent_in_pool:.2f}% | {percent_supply_burnt:.2f}% 🔥Burn"
+
+        # --- FAST MODE: Parallelized RPC ---
+        burn_addrs = BURN_ADDRESSES_CHECKSUM
+
+        # Ambil LP burns paralel (3 address)
+        lp_burns = [
+            _safe_rpc_call(lambda c=a: lp_contract.functions.balanceOf(c).call())
+            for a in burn_addrs
+        ]
+
+        lp_total_burnt = sum(x or 0 for x in lp_burns)
+
+        lp_burn_percent = (lp_total_burnt / lp_total_supply) * 100
+
+        # Ambil token burns paralel (3 address)
+        token_burns = [
+            _safe_rpc_call(lambda c=a: token_contract.functions.balanceOf(c).call())
+            for a in burn_addrs
+        ]
+
+        token_total_burnt = sum(x or 0 for x in token_burns)
+        token_burn_percent = (token_total_burnt / token_total_supply) * 100
+
+        # Balance token in LP
+        token_in_pool = _safe_rpc_call(lambda: token_contract.functions.balanceOf(lp).call()) or 0
+        token_in_pool_percent = (token_in_pool / token_total_supply) * 100
+
+        data["LP_burnt"] = f"{lp_burn_percent:.2f}% 🔥 | {lp_source}"
+        data["Supply_in_Pool"] = f"Pool: {token_in_pool_percent:.2f}% | Burn: {token_burn_percent:.2f}%"
+
     except Exception as e:
-        logging.error(f"Deep LP Scan failed: {e}")
-        data["LP_burnt"] = "Error LP Scan"; data["Supply_in_Pool"] = "Error Supply Scan"
+        logging.error(f"LP Scan Error: {e}")
+        data["LP_burnt"] = "Error LP Scan"
+        data["Supply_in_Pool"] = "Error Supply Scan"
+
     return data
 
-async def get_graph_market_data_async(ca: str) -> Dict[str, Any]:
-    GRAPHQL_URL_V2 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsexv2/graphql"
-    GRAPHQL_URL_V1 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsex/graphql"
-    ca_lower = ca.lower()
-    query_v2 = """
-    query TokenData($tokenAddress: String!, $wplsAddress: String!) {
-      token: token(id: $tokenAddress) { totalSupply }
-      pairs: pairs(where: { and: [{ token0_in: [$tokenAddress, $wplsAddress] }, { token1_in: [$tokenAddress, $wplsAddress] }] }, first: 1, orderBy: reserveUSD, orderDirection: desc) {
-        id; reserveUSD; volumeUSD
-        token0 { id }; token1 { id }; token0Price; token1Price 
-        dayData(first: 1, orderBy: date, orderDirection: desc) {
-          priceUSD; volumeUSD; untrackedVolumeUSD; liquidityUSD; priceChangeUSD: priceUSD
-        }
-      }
-    }
-    """
-    variables = {"tokenAddress": ca_lower, "wplsAddress": WPLS_CHECKSUM_LOWER}
-    tasks = [query_graphql(GRAPHQL_URL_V2, query_v2, variables), query_graphql(GRAPHQL_URL_V1, query_v2, variables)]
-    v2_data, v1_data = await asyncio.gather(*tasks, return_exceptions=True)
-    v2_data = v2_data if not isinstance(v2_data, Exception) else None
-    v1_data = v1_data if not isinstance(v1_data, Exception) else None
 
-    results = {"market_data": None, "LP_Address": None, "LP_Source_Name": None, "LP_PLS_Ratio": 0.0, "Token_Total_Supply": 0.0, "raw_pair_data": []}
+# --- FUNGSI BARU UNTUK DEXSCREENER ---
+async def fetch_dexscreener_data(lp_address: str, token_ca: str) -> Dict[str, Any]:
+    # KOREKSI KRITIS: Pastikan LP Address adalah lowercase untuk Dexscreener API Path
+    lp_address_lower = lp_address.lower()
+    url_pair = f"https://api.dexscreener.com/latest/dex/pairs/{PULSECHAIN_CHAIN_ID}/{lp_address_lower}"
     
-    if v2_data and v2_data.get('token') and v2_data['token'].get('totalSupply'): results["Token_Total_Supply"] = float(v2_data['token']['totalSupply'])
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await _httpx_get(client, url_pair)
+        
+        if not r or r.status_code != 200:
+            logging.warning(f"Dexscreener failed for LP {lp_address} ({lp_address_lower}): Status {r.status_code if r else 'N/A'}")
+            return {"error": "Dexscreener fetch failed"}
+            
+        data = r.json()
+        pairs = data.get('pairs', [])
+        
+        if not pairs:
+            return {"error": "No pair data found on Dexscreener"}
+            
+        best_dex_pair = pairs[0] 
+
+        price_usd = float(best_dex_pair.get('priceUsd', 0))
+        liquidity = float(best_dex_pair.get('liquidity', {}).get('usd', 0))
+        volume_24h = float(best_dex_pair.get('volume', {}).get('h24', 0))
+        price_change_24h = float(best_dex_pair.get('priceChange', {}).get('h24', 0))
+        market_cap = float(best_dex_pair.get('fdv', 0) or best_dex_pair.get('marketCap', 0)) 
+        
+        return {
+            "Price": price_usd,
+            "Liquidity": liquidity,
+            "Price_Change": price_change_24h,
+            "Volume": volume_24h,
+            "Market_Cap": market_cap,
+            "LP_Source_Name": best_dex_pair.get('dexId', 'Dexscreener')
+        }
+    
+# --- END FUNGSI DEXSCREENER ---
+
+async def get_graph_market_data_async(ca: str) -> Dict[str, Any]:
+    # CATATAN: Fungsi ini disederhanakan hanya untuk mengambil Pair ID terbaik dan Total Supply
+    
+    GRAPHQL_URL_V2 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsexv2"
+    GRAPHQL_URL_V1 = "https://graph.pulsechain.com/subgraphs/name/pulsechain/pulsex"
+    
+    ca_lower = ca.lower()
+    
+    # Query disederhanakan hanya untuk mengambil Total Supply, DerivedUSD (sebagai fallback Price), dan Pair ID/Liquidity terbaik.
+    query = f"""
+    query TokenData {{
+      token(id: "{ca_lower}") {{ totalSupply derivedUSD }}
+      pairs(where: {{
+        token0_in: ["{ca_lower}", "{WPLS_CHECKSUM_LOWER}"], 
+        token1_in: ["{ca_lower}", "{WPLS_CHECKSUM_LOWER}"],
+        reserveUSD_gt: "0"
+      }}, first: 1, orderBy: reserveUSD, orderDirection: desc) {{
+        id 
+        reserveUSD
+        token0 {{ id }} 
+        token1 {{ id }}
+      }}
+    }}
+    """
+    
+    tasks = [query_graphql(GRAPHQL_URL_V2, query), query_graphql(GRAPHQL_URL_V1, query)]
+    v2_data_raw, v1_data_raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    v2_data = v2_data_raw if v2_data_raw and not isinstance(v2_data_raw, Exception) else None
+    v1_data = v1_data_raw if v1_data_raw and not isinstance(v1_data_raw, Exception) else None
+
+    # Ambil Total Supply dan Price Fallback
+    derived_usd_v2 = float(v2_data.get('token', {}).get('derivedUSD', 0)) if v2_data and v2_data.get('token') else 0
+    derived_usd_v1 = float(v1_data.get('token', {}).get('derivedUSD', 0)) if v1_data and v1_data.get('token') else 0
+    best_derived_usd = max(derived_usd_v2, derived_usd_v1)
+    
+    token_supply_v2 = float(v2_data.get('token', {}).get('totalSupply', 0)) if v2_data and v2_data.get('token') else 0
+    token_supply_v1 = float(v1_data.get('token', {}).get('totalSupply', 0)) if v1_data and v1_data.get('token') else 0
+    best_total_supply = max(token_supply_v2, token_supply_v1)
+
     all_pairs = []
-    if v2_data and v2_data.get('pairs'): all_pairs.extend([p | {"source_id": "PulseX V2"} for p in v2_data['pairs'] if float(p.get('reserveUSD', 0)) > 0])
-    if v1_data and v1_data.get('pairs'): all_pairs.extend([p | {"source_id": "PulseX V1"} for p in v1_data['pairs'] if float(p.get('reserveUSD', 0)) > 0])
+    if v2_data and v2_data.get('pairs'): all_pairs.extend([p | {"source_id": "PulseX V2"} for p in v2_data['pairs']])
+    if v1_data and v1_data.get('pairs'): all_pairs.extend([p | {"source_id": "PulseX V1"} for p in v1_data['pairs']])
+    
+    # Init results dengan fallback data
+    results = {"market_data": {"Price": best_derived_usd, "Liquidity": 0.0, "Price_Change": 0.0, "Volume": 0.0, "Market_Cap": best_total_supply * best_derived_usd}, 
+               "LP_Address": None, "LP_Source_Name": None, "LP_PLS_Ratio": 0.0, "Token_Total_Supply": best_total_supply}
     
     if not all_pairs: return results
-    best_pair = max(all_pairs, key=lambda p: float(p.get('reserveUSD', 0)))
-    if best_pair["token0"]["id"] == ca_lower: token_pls_ratio = float(best_pair["token0Price"])
-    elif best_pair["token1"]["id"] == ca_lower: token_pls_ratio = float(best_pair["token1Price"])
-    else: token_pls_ratio = 0.0
-
-    price_usd = 0.0; price_change_24h = 0.0
-    if best_pair.get('dayData'): day_data = best_pair['dayData'][0]; price_usd = float(day_data.get('priceUSD', 0))
     
+    best_pair = max(all_pairs, key=lambda p: float(p.get('reserveUSD', 0)))
+    
+    # Update hasil dengan data Pair terbaik
     results["LP_Address"] = w3.to_checksum_address(best_pair['id'])
     results["LP_Source_Name"] = best_pair.get("source_id", "Unknown DEX")
-    results["LP_PLS_Ratio"] = token_pls_ratio
-    results["market_data"] = {"Price": price_usd, "Liquidity": float(best_pair.get('reserveUSD', 0)), "Price_Change": price_change_24h, "Volume": float(best_pair.get('volumeUSD', 0))}
+    results["market_data"]["Liquidity"] = float(best_pair.get('reserveUSD', 0))
+    
     return results
 
 def _try_extract_abi_from_metadata_obj(meta_obj: Any) -> Optional[List[Dict[str, Any]]]:
@@ -423,48 +528,93 @@ async def get_verification_status(ca: str, chain_id: int = 369, std_json: dict |
 async def deep_scan_contract(ca):
     results = {"metadata": {}, "Verify": "UNKNOWN", "Owner": "N/A (Owner function not found)", "Upgradeable": "UNKNOWN", "LP_Address": "N/A (PulseX V2/V1)", "LP_burnt": "N/A", "Supply_in_Pool": "N/A", "LP_Source_Name": "Unknown DEX", "Sus_Features": "N/A", "market_data": {}}
     if not w3 or not w3.is_connected(): results['Verify'] = "RPC Connection Failed"; return results
+    
+    # 1. Ambil data: Verifikasi, GraphQL (untuk LP/Supply), Metadata
     tasks = [get_verification_status(ca), get_graph_market_data_async(ca), asyncio.to_thread(get_token_metadata_sync, ca)]
-    verify_status, graph_market_data, metadata = await asyncio.gather(*tasks)
+    verify_status, graph_market_data, metadata = await asyncio.gather(*tasks, return_exceptions=True)
 
-    market_data_raw = graph_market_data.get('market_data') if graph_market_data else {}
-    token_total_supply = graph_market_data.get('Token_Total_Supply') if graph_market_data else 0
+    # Penanganan Error Gathering
+    graph_market_data = graph_market_data if not isinstance(graph_market_data, Exception) and graph_market_data else {}
+    verify_status = verify_status if not isinstance(verify_status, Exception) else ("⚠️ Verification fetch failed", None, None)
+    metadata = metadata if not isinstance(metadata, Exception) else {"Name": "Error", "Ticker": "ERR", "Decimals": 18}
+
+    # Ambil data LP dan Total Supply dari hasil GraphQL
     lp_to_scan = graph_market_data.get('LP_Address'); lp_source = graph_market_data.get('LP_Source_Name')
-    results["market_data"] = market_data_raw if market_data_raw and not market_data_raw.get("error") else {}
+    token_total_supply = graph_market_data.get('Token_Total_Supply')
+    
+    # Inisialisasi market_data dengan fallback dari GraphQL
+    market_data_fallback = graph_market_data.get('market_data', {})
+    
+    # Ganti Market Data Awal dengan data yang diperoleh dari Dexscreener jika LP ditemukan
+    if lp_to_scan:
+        dexscreener_data = await fetch_dexscreener_data(lp_to_scan, ca)
+        if not dexscreener_data.get("error"):
+            # Jika Dexscreener berhasil, gunakan data pasar dari Dexscreener
+            results["market_data"] = {
+                "Price": dexscreener_data.get("Price", 0.0),
+                "Liquidity": dexscreener_data.get("Liquidity", 0.0),
+                "Price_Change": dexscreener_data.get("Price_Change", 0.0),
+                "Volume": dexscreener_data.get("Volume", 0.0),
+                "Market_Cap": dexscreener_data.get("Market_Cap", 0.0),
+            }
+            results["LP_Source_Name"] = f"{lp_source} (via {dexscreener_data['LP_Source_Name']})"
+        else:
+            # Jika Dexscreener gagal, gunakan data GraphQL dasar dan MarketCap fallback
+            results["market_data"] = {
+                "Price": market_data_fallback.get("Price", 0.0),
+                "Liquidity": market_data_fallback.get("Liquidity", 0.0),
+                "Price_Change": 0.0, 
+                "Volume": 0.0,      
+                "Market_Cap": market_data_fallback.get("Market_Cap", 0.0),
+            }
+    else:
+        # Jika tidak ada LP address sama sekali dari GraphQL
+        results["market_data"] = {"Price": 0.0, "Liquidity": 0.0, "Price_Change": 0.0, "Volume": 0.0, "Market_Cap": 0.0}
+
     try: results["Verify"], full_abi, source_code = verify_status
     except Exception: results["Verify"], full_abi, source_code = ("⚠️ Verification fetch failed", None, None)
     results["metadata"] = metadata
+    
     abi_to_use = full_abi if full_abi else TOKEN_MINIMAL_ABI
     try: token_contract = w3.eth.contract(address=w3.to_checksum_address(ca), abi=abi_to_use)
     except Exception: results["Owner"] = "Error in Web3 Contract Init"; return results
+    
+    # 2. Ambil data: Owner, Tax, Sus Features (Batch RPC/Sync)
     owner_call_safe = lambda: _safe_rpc_call(token_contract.functions.owner().call)
     try:
         if full_abi: sus_features_task = asyncio.to_thread(scan_suspicious_features_sync, token_contract, source_code)
         else: sus_features_task = asyncio.to_thread(lambda: extra_scan_source_patterns(source_code or "", [], []))
     except Exception as e: sus_features_task = asyncio.to_thread(lambda: [f"⚠️ Sus scan setup failed: {e}"])
+    
     has_owner_func = any(isinstance(f, dict) and f.get('name') == 'owner' for f in (abi_to_use or []))
-    tasks_rpc_critical = [asyncio.to_thread(owner_call_safe) if has_owner_func else asyncio.to_thread(lambda: None), asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V2_ADDRESS), asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V1_ADDRESS), sus_features_task]
+    tasks_rpc_critical = [
+        asyncio.to_thread(owner_call_safe) if has_owner_func else asyncio.to_thread(lambda: None), 
+        asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V2_ADDRESS), 
+        asyncio.to_thread(get_tax_info_simulation_sync, ca, HONEY_V1_ADDRESS), 
+        sus_features_task
+    ]
     owner_address, tax_data_v2_raw, tax_data_v1_raw, sus_scan_raw = await asyncio.gather(*tasks_rpc_critical, return_exceptions=True)
 
+    # 3. Pemrosesan Hasil
     owner_address = None if isinstance(owner_address, Exception) else owner_address
     tax_data_v2_raw = tax_data_v2_raw if not isinstance(tax_data_v2_raw, Exception) else {"error": str(tax_data_v2_raw)}
     tax_data_v1_raw = tax_data_v1_raw if not isinstance(tax_data_v1_raw, Exception) else {"error": str(tax_data_v1_raw)}
+    
+    # Normalisasi Sus Features (dipertahankan)
     sus_scan_output = []
     try:
         if isinstance(sus_scan_raw, Exception): sus_scan_output = [f"⚠️ Error sus Features Scan: {sus_scan_raw.__class__.__name__}"]
         else:
-            if isinstance(sus_scan_raw, tuple) and len(sus_scan_raw) >= 1:
-                cand = sus_scan_raw[0]
-                if isinstance(cand, list): sus_scan_output = cand
-                elif isinstance(cand, str): sus_scan_output = [cand]
-                else: sus_scan_output = list(cand) if cand else []
+            if isinstance(sus_scan_raw, tuple) and len(sus_scan_raw) >= 1: cand = sus_scan_raw[0]; sus_scan_output = list(cand) if isinstance(cand, list) else ([cand] if isinstance(cand, str) else ([str(cand)] if cand else []))
             elif isinstance(sus_scan_raw, list): sus_scan_output = sus_scan_raw
             elif isinstance(sus_scan_raw, str): sus_scan_output = [sus_scan_raw]
-            elif sus_scan_raw is None: sus_scan_output = []
-            else: sus_scan_output = [str(sus_scan_raw)]
+            else: sus_scan_output = [str(sus_scan_raw)] if sus_scan_raw else []
     except Exception as e: sus_scan_output = [f"Error normalizing sus scan output: {e}"]
 
     results["LP_Address"] = lp_to_scan if lp_to_scan else f"N/A (WPLS Pair not found in PulseX V2/V1)"; results["LP_Source_Name"] = lp_source if lp_source else "Unknown DEX"
     results["V2_Tax"] = process_tax_results(tax_data_v2_raw); results["V1_Tax"] = process_tax_results(tax_data_v1_raw)
+    
+    # (Logika Owner & Upgradeable dipertahankan)
     owner_is_burned = False
     if owner_address is not None:
         try:
@@ -491,13 +641,16 @@ async def deep_scan_contract(ca):
             results["Upgradeable"] = "❌ Not Renounced" if has_critical_sus_feature else "❌ Not Renounced"; results["Sus_Features"] = "\n".join(sus_scan_output)
         else: results["Upgradeable"] = "❌ Unknown Ownership"; results["Sus_Features"] = "\n".join(sus_scan_output)
     except Exception as e: results["Upgradeable"] = "❌ Unknown Ownership"; results["Sus_Features"] = "\n".join(sus_scan_output) if isinstance(sus_scan_output, list) else str(sus_scan_output)
+
+    # 4. Ambil data LP Burn & Supply in Pool (Sync)
     try:
         if lp_to_scan and token_total_supply is not None and token_total_supply > 0:
             lp_scan_data = await asyncio.to_thread(lambda: deep_lp_scan_sync(lp_to_scan, token_contract, token_total_supply, w3, BURN_ADDRESSES_CHECKSUM, lp_source))
             if lp_scan_data and isinstance(lp_scan_data.get("LP_burnt"), str): results.update(lp_scan_data)
             else: results["LP_burnt"] = "Error LP Scan"; results["Supply_in_Pool"] = "Error Supply Scan"
-        else: results["LP_burnt"] = "N/A"; results["Supply_in_Pool"] = "N/A"
+        else: results["LP_burnt"] = "N/A (No LP)"; results["Supply_in_Pool"] = "N/A (No LP)"
     except Exception: results["LP_burnt"] = "Error LP Scan"; results["Supply_in_Pool"] = "Error Supply Scan"
+    
     return results
 
 async def padiscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,20 +686,36 @@ async def padiscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     metadata = deep_scan_results.pop('metadata', {})
     market_data = deep_scan_results.pop('market_data', {})
-    safe_market_data = {k: market_data.get(k, 0.0) for k in ['Price', 'Liquidity', 'Price_Change', 'Volume']}
+    
+    # Market Data sekarang berisi Market_Cap, Price_Change, Volume dari Dexscreener/Fallback
+    safe_market_data = {k: market_data.get(k, 0.0) for k in ['Price', 'Liquidity', 'Price_Change', 'Volume', 'Market_Cap']} 
+    
     lp_source_name_escaped = escape_markdown_v2(deep_scan_results.get('LP_Source_Name', 'Unknown DEX'))
 
     v2_tax_data = deep_scan_results.pop('V2_Tax', {})
     v1_tax_data = deep_scan_results.pop('V1_Tax', {})
     
-    best_tax_data = v2_tax_data if deep_scan_results.get('LP_Source_Name') == "PulseX V2" else (v1_tax_data if deep_scan_results.get('LP_Source_Name') == "PulseX V1" else v2_tax_data)
+    # Prioritaskan tax data dari LP yang paling liquid (sudah ditentukan oleh LP_Source_Name)
+    best_tax_data = v2_tax_data
+    if deep_scan_results.get('LP_Source_Name', '').startswith("PulseX V1"): # Cek Source Name yang didapat dari GraphQL
+        best_tax_data = v1_tax_data
+    elif deep_scan_results.get('LP_Source_Name', '').startswith("Unknown DEX"):
+          best_tax_data = v2_tax_data # Default ke V2 jika tidak ada LP, untuk mencoba menampilkan hasil sim
 
-    honeypot_ui = "❌ No LP or trading not enabled yet"
-    if best_tax_data.get('Honeypot') == '✅ OK':
-        honeypot_ui = "✅ Not a Honeypot"
-    elif best_tax_data.get('Honeypot', '').startswith('🚨'):
-        honeypot_ui = "❌ Honeypot"
+    # KOREKSI KRITIS: Logika Honeypot
+    # Cek apakah ada simulasi tax yang berhasil sama sekali
+    tax_sim_successful = best_tax_data.get('BuySuccess') or best_tax_data.get('SellSuccess') or \
+                         v1_tax_data.get('BuySuccess') or v1_tax_data.get('SellSuccess')
 
+    honeypot_ui = "❌ Unknown (Tax Sim Failed)"
+    if deep_scan_results.get('LP_Address', 'N/A').startswith("N/A (WPLS Pair not found"):
+          honeypot_ui = "❌ No LP or Trading Data"
+    elif tax_sim_successful:
+        if best_tax_data.get('Honeypot') == '✅ OK':
+            honeypot_ui = "✅ Not a Honeypot"
+        elif best_tax_data.get('Honeypot', '').startswith('🚨'):
+            honeypot_ui = "❌ Honeypot"
+    
     # --- PENERAPAN MARKDOWN ESCAPE YANG LENGKAP ---
     metadata_name = escape_markdown_v2(metadata.get('Name', 'Unknown Token'))
     metadata_ticker = escape_markdown_v2(metadata.get('Ticker', 'TOKEN'))
@@ -564,9 +733,13 @@ async def padiscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     honeypot_ui_escaped = escape_markdown_v2(honeypot_ui)
     
     lp_burnt_escaped = escape_markdown_v2(deep_scan_results.get('LP_burnt', 'N/A'))
-    supply_in_pool_escaped = escape_markdown_v2(deep_scan_results.get('Supply_in_Pool', 'N/A'))
     
+    # Mengandalkan escape_markdown_v2 untuk lolos karakter |
+    supply_in_pool_escaped = escape_markdown_v2(deep_scan_results.get('Supply_in_Pool', 'N/A')) 
+    
+    # MARKET DATA DARI DEXSCREENER/FALLBACK
     price_escaped = escape_markdown_v2(f"{safe_market_data['Price']:.10f}")
+    market_cap_escaped = escape_markdown_v2(human_format(safe_market_data['Market_Cap'], decimals=2))
     liquidity_escaped = escape_markdown_v2(human_format(safe_market_data['Liquidity'], decimals=2))
     volume_escaped = escape_markdown_v2(human_format(safe_market_data['Volume'], decimals=2))
     price_change_escaped = escape_markdown_v2(f"{safe_market_data['Price_Change']:.2f}")
@@ -597,6 +770,7 @@ async def padiscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Supply Left:* {supply_in_pool_escaped}
 {separator_line}
 💰 *Price:* \\${price_escaped}
+📊 *Market Cap:* \\${market_cap_escaped}
 💧 *Liquidity:* \\${liquidity_escaped}
 🔄 *Price Change \\(24h\\):* {price_change_escaped}\\%
 🔊 *Volume \\(24h\\):* \\${volume_escaped}
@@ -618,4 +792,6 @@ async def padiscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='MarkdownV2'
         )
     except Exception as e:
+        # Jika Bad Request (Markdown error), laporkan ke user.
+        logging.error(f"Error sending message: {e}")
         await update.message.reply_text(f"⚠️ Failed to send full report \\(Error: {escape_markdown_v2(e.__class__.__name__)}\\)\\. Try again or check logs", parse_mode='MarkdownV2')
